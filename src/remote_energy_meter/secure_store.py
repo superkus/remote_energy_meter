@@ -156,6 +156,16 @@ class StoreFault(StrEnum):
     KEY_EXISTS = "key_exists"
     """A new state-authentication key was to be created, but one already exists; it is never replaced."""
 
+    IDENTITY_MISSING = "identity_missing"
+    """A durable identity (for example the control TLS identity) is required but has never been created."""
+
+    IDENTITY_EXISTS = "identity_exists"
+    """A durable identity was to be created, but one already exists; it is never replaced."""
+
+    IDENTITY_INCONSISTENT = "identity_inconsistent"
+    """An identity record is authentic and well formed but its parts disagree, for example a certificate whose key is
+    not the stored private key, or an identifier that is not the hash of the key."""
+
     AUTHENTICATION_FAILED = "authentication_failed"
     """A record's integrity tag does not verify under the state-authentication key: the record was altered, moved to
     another store or generation, or written under a different key."""
