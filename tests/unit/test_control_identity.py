@@ -479,6 +479,15 @@ def test_renewing_a_missing_identity_writes_nothing(store: ControlIdentityStore)
     assert not store.path.exists()
 
 
+def test_renewing_a_missing_identity_without_a_key_reports_the_missing_identity(tmp_path: Path, clock: Clock) -> None:
+    keyless = ControlIdentityStore(
+        tmp_path / "control", keys=StateAuthenticationKeyStore(tmp_path / "keys"), clock=clock
+    )
+
+    assert fault_of(keyless.renew) is StoreFault.IDENTITY_MISSING
+    assert not keyless.path.exists()
+
+
 # --------------------------------------------------------------------------------------------------
 # the private key stays inside the identity
 # --------------------------------------------------------------------------------------------------

@@ -25,6 +25,7 @@ tombstones) need tamper evidence as well. This module adds it:
   which writes generation 1 only if no document exists (an exclusive hard link, so a concurrent creator is never
   overwritten), and :meth:`~AuthenticatedDocumentStore.update`, which hands the verified current record to a callback
   and writes the result under the same store lock, so no other writer's change falls between read and write.
+
 What the tag cannot prove is freshness. It gives authenticity and binding to the store, schema version, and
 generation, and the key never rotates, so every record it ever tagged stays authentic. An older record restored on its
 own, or a record deleted, while no instance is running therefore loads after a restart as that older generation, or as

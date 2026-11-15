@@ -227,6 +227,11 @@ class ControlIdentityStore:
                 disagree or renewal would change the SPKI; any other fault of :meth:`load`.
         """
 
+        # The update loads the key first, so without this check a missing identity would report KEY_MISSING when the
+        # key is also missing. The identity is the more specific fault; the update re-checks under its lock.
+        if self._document.load() is None:
+            raise SecureStoreError(StoreFault.IDENTITY_MISSING, f"{self.path} does not exist")
+
         def reissue(current: StoredDocument | None) -> Mapping[str, JsonValue]:
             if current is None:
                 raise SecureStoreError(StoreFault.IDENTITY_MISSING, f"{self.path} does not exist")
