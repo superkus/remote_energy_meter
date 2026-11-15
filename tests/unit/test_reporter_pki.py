@@ -6,16 +6,17 @@ import base64
 import copy
 import dataclasses
 import hashlib
+import ipaddress
 import pickle
 import stat
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID
 
@@ -614,3 +615,324 @@ def test_renewing_when_the_leaf_vanishes_under_the_lock_reports_it_missing(
     monkeypatch.setattr(leaf_document, "update", update_with_nothing)
 
     assert fault_of(pki.renew_leaf) is StoreFault.IDENTITY_MISSING
+
+
+# --------------------------------------------------------------------------------------------------
+# load-time certificate checks (authentic records whose certificates are wrongly shaped)
+# --------------------------------------------------------------------------------------------------
+
+
+def key_usage(**enabled: bool) -> x509.KeyUsage:
+    flags = dict.fromkeys(
+        (
+            "digital_signature",
+            "content_commitment",
+            "key_encipherment",
+            "data_encipherment",
+            "key_agreement",
+            "key_cert_sign",
+            "crl_sign",
+            "encipher_only",
+            "decipher_only",
+        ),
+        False,
+    )
+    flags.update(enabled)
+    return x509.KeyUsage(**flags)
+
+
+_CA_BASIC = x509.BasicConstraints(ca=True, path_length=0)
+_CA_USAGE = key_usage(key_cert_sign=True, crl_sign=True)
+_LEAF_BASIC = x509.BasicConstraints(ca=False, path_length=None)
+_LEAF_USAGE = key_usage(digital_signature=True)
+_LEAF_EKU = (ExtendedKeyUsageOID.SERVER_AUTH,)
+
+
+def forge_ca_certificate(
+    pki: ReporterPkiStore,
+    *,
+    basic: x509.BasicConstraints | None = _CA_BASIC,
+    basic_critical: bool = True,
+    usage: x509.KeyUsage | None = _CA_USAGE,
+) -> str:
+    """A self-signed certificate over the real CA key, shaped as told; ``None`` omits the extension."""
+    ca = pki.load_ca()
+    key = ca.private_key()
+    name = x509.load_der_x509_certificate(ca.certificate_der).subject
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(ca.not_before)
+        .not_valid_after(ca.not_after)
+    )
+    if basic is not None:
+        builder = builder.add_extension(basic, critical=basic_critical)
+    if usage is not None:
+        builder = builder.add_extension(usage, critical=True)
+    return b64(builder.sign(key, hashes.SHA256()).public_bytes(serialization.Encoding.DER))
+
+
+def forge_leaf_certificate(
+    pki: ReporterPkiStore,
+    *,
+    basic: x509.BasicConstraints | None = _LEAF_BASIC,
+    basic_critical: bool = True,
+    usage: x509.KeyUsage | None = _LEAF_USAGE,
+    eku: Sequence[x509.ObjectIdentifier] | None = _LEAF_EKU,
+    extra_names: list[x509.GeneralName] | None = None,
+    not_before_shift: timedelta | None = None,
+    not_after_shift: timedelta | None = None,
+) -> str:
+    """A certificate over the real leaf key signed by the real CA key, shaped as told; ``None`` omits an extension.
+
+    The validity is the leaf's own unless a shift relative to the CA's validity is given.
+    """
+    ca = pki.load_ca()
+    leaf = pki.load_leaf()
+    ca_certificate = x509.load_der_x509_certificate(ca.certificate_der)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(x509.load_der_x509_certificate(leaf.certificate_der).subject)
+        .issuer_name(ca_certificate.subject)
+        .public_key(leaf.private_key().public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(leaf.not_before if not_before_shift is None else ca.not_before + not_before_shift)
+        .not_valid_after(leaf.not_after if not_after_shift is None else ca.not_after + not_after_shift)
+        .add_extension(
+            x509.SubjectAlternativeName([x509.DNSName(n) for n in leaf.dns_names] + (extra_names or [])),
+            critical=False,
+        )
+    )
+    if basic is not None:
+        builder = builder.add_extension(basic, critical=basic_critical)
+    if usage is not None:
+        builder = builder.add_extension(usage, critical=True)
+    if eku is not None:
+        builder = builder.add_extension(x509.ExtendedKeyUsage(eku), critical=False)
+    return b64(builder.sign(ca.private_key(), hashes.SHA256()).public_bytes(serialization.Encoding.DER))
+
+
+def test_a_forged_ca_certificate_with_the_issued_shape_loads(
+    pki: ReporterPkiStore, keys: StateAuthenticationKeyStore
+) -> None:
+    """Guards the helper: the failures below are caused by the one deviation, not by the forgery itself."""
+    created = pki.create(NAMES)
+
+    fresh = rewrite(pki, keys, leaf=False, certificate_der=forge_ca_certificate(pki))
+
+    assert fresh.load_ca().spki_sha256 == created.ca_spki_sha256
+
+
+def test_a_forged_leaf_certificate_with_the_issued_shape_loads(
+    pki: ReporterPkiStore, keys: StateAuthenticationKeyStore
+) -> None:
+    """Guards the helper: the failures below are caused by the one deviation, not by the forgery itself."""
+    pki.create(NAMES)
+
+    fresh = rewrite(pki, keys, leaf=True, certificate_der=forge_leaf_certificate(pki))
+
+    assert fresh.load_leaf().dns_names == NAMES
+
+
+@pytest.mark.parametrize(
+    "deviation",
+    [
+        pytest.param({"basic": x509.BasicConstraints(ca=True, path_length=None)}, id="path-length-unlimited"),
+        pytest.param({"basic": x509.BasicConstraints(ca=True, path_length=1)}, id="path-length-one"),
+        pytest.param({"basic_critical": False}, id="basic-constraints-not-critical"),
+        pytest.param({"usage": None}, id="no-key-usage"),
+        pytest.param({"usage": key_usage(crl_sign=True)}, id="key-usage-without-key-cert-sign"),
+    ],
+)
+def test_a_ca_certificate_that_is_not_a_critical_path_length_zero_signing_ca_is_inconsistent(
+    pki: ReporterPkiStore, keys: StateAuthenticationKeyStore, deviation: dict[str, Any]
+) -> None:
+    pki.create(NAMES)
+    fresh = rewrite(pki, keys, leaf=False, certificate_der=forge_ca_certificate(pki, **deviation))
+
+    assert fault_of(fresh.load_ca) is StoreFault.IDENTITY_INCONSISTENT
+
+
+_SERVER = ExtendedKeyUsageOID.SERVER_AUTH
+_CLIENT = ExtendedKeyUsageOID.CLIENT_AUTH
+_DAY = timedelta(days=1)
+_MINUTE = timedelta(minutes=1)
+
+
+@pytest.mark.parametrize(
+    "deviation",
+    [
+        pytest.param({"eku": [_CLIENT]}, id="client-auth-only"),
+        pytest.param({"eku": None}, id="no-extended-key-usage"),
+        pytest.param({"eku": [_SERVER, _CLIENT]}, id="server-auth-plus-another"),
+        pytest.param({"usage": None}, id="no-key-usage"),
+        pytest.param({"usage": key_usage(digital_signature=True, key_cert_sign=True)}, id="key-cert-sign"),
+        pytest.param({"usage": key_usage(key_agreement=True)}, id="no-digital-signature"),
+        pytest.param({"basic": None}, id="no-basic-constraints"),
+        pytest.param({"basic_critical": False}, id="basic-constraints-not-critical"),
+        pytest.param({"extra_names": [x509.IPAddress(ipaddress.ip_address("192.0.2.1"))]}, id="extra-ip-address-name"),
+        pytest.param({"extra_names": [x509.UniformResourceIdentifier("https://example.com/")]}, id="extra-uri-name"),
+        pytest.param({"not_after_shift": _DAY}, id="outlives-the-ca"),
+        pytest.param({"not_before_shift": -_MINUTE}, id="starts-before-the-ca"),
+    ],
+)
+def test_a_leaf_certificate_that_is_not_a_plain_server_authentication_leaf_is_inconsistent(
+    pki: ReporterPkiStore, keys: StateAuthenticationKeyStore, deviation: dict[str, Any]
+) -> None:
+    pki.create(NAMES)
+    fresh = rewrite(pki, keys, leaf=True, certificate_der=forge_leaf_certificate(pki, **deviation))
+
+    assert fault_of(fresh.load_leaf) is StoreFault.IDENTITY_INCONSISTENT
+
+
+# --------------------------------------------------------------------------------------------------
+# issuance under a clock that stepped back
+# --------------------------------------------------------------------------------------------------
+
+
+def test_a_leaf_issued_after_the_clock_stepped_back_never_starts_before_the_ca(
+    pki: ReporterPkiStore, clock: Clock
+) -> None:
+    ca = pki.create_ca()
+    clock.now = T0 - timedelta(days=1)
+
+    leaf = pki.create_leaf(NAMES)
+
+    assert leaf.not_before >= ca.not_before
+    assert pki.load_leaf() == leaf
+
+
+def test_a_renewed_leaf_after_the_clock_stepped_back_never_starts_before_the_ca(
+    pki: ReporterPkiStore, clock: Clock
+) -> None:
+    ca = pki.create_ca()
+    pki.create_leaf(NAMES)
+    clock.now = T0 - timedelta(days=1)
+
+    renewed = pki.renew_leaf()
+
+    assert renewed.not_before >= ca.not_before
+
+
+def test_nothing_is_issued_at_the_first_instant_a_ca_is_valid_when_the_backdate_would_precede_it(
+    pki: ReporterPkiStore, clock: Clock
+) -> None:
+    ca = pki.create_ca()
+    clock.now = ca.not_before + timedelta(minutes=1)  # inside the backdate window: now - 5 min precedes the CA
+
+    leaf = pki.create_leaf(NAMES)
+
+    assert leaf.not_before >= ca.not_before
+
+
+# --------------------------------------------------------------------------------------------------
+# directories
+# --------------------------------------------------------------------------------------------------
+
+
+def test_directories_that_are_the_same_through_a_symlink_are_rejected(
+    tmp_path: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    real = tmp_path / "real"
+    real.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(real, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="different directories"):
+        ReporterPkiStore(real, alias, keys=keys)
+    with pytest.raises(ValueError, match="different directories"):
+        ReporterPkiStore(alias, real, keys=keys)
+
+
+def test_directories_that_are_the_same_through_dot_dot_spelling_are_rejected(
+    tmp_path: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    with pytest.raises(ValueError, match="different directories"):
+        ReporterPkiStore(tmp_path / "d", tmp_path / "x" / ".." / "d", keys=keys)
+
+
+def test_a_directory_nested_inside_the_other_is_rejected_either_way_round(
+    tmp_path: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    with pytest.raises(ValueError):
+        ReporterPkiStore(tmp_path / "outer", tmp_path / "outer" / "inner", keys=keys)
+    with pytest.raises(ValueError):
+        ReporterPkiStore(tmp_path / "outer" / "inner", tmp_path / "outer", keys=keys)
+
+
+def test_a_nested_directory_through_a_symlink_is_rejected(tmp_path: Path, keys: StateAuthenticationKeyStore) -> None:
+    outer = tmp_path / "outer"
+    outer.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(outer, target_is_directory=True)
+
+    with pytest.raises(ValueError):
+        ReporterPkiStore(outer, alias / "inner", keys=keys)
+
+
+def test_siblings_with_a_common_name_prefix_are_not_treated_as_nested(
+    tmp_path: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    ReporterPkiStore(tmp_path / "ca", tmp_path / "ca-leaf", keys=keys)
+
+
+def test_a_failed_leaf_directory_leaves_no_ca_behind(
+    tmp_path: Path, keys: StateAuthenticationKeyStore, clock: Clock
+) -> None:
+    blocker = tmp_path / "leaf"
+    blocker.write_text("not a directory")
+    store = ReporterPkiStore(tmp_path / "ca", blocker, keys=keys, clock=clock)
+
+    with pytest.raises(SecureStoreError):
+        store.create(NAMES)
+
+    assert not store.ca_path.exists()
+
+
+# --------------------------------------------------------------------------------------------------
+# host names, stricter forms
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "names",
+    [
+        ["a.0x7f"],
+        ["1.2.3.4"],
+        ["host.2lan"],
+        ["xn--zz"],
+        [b"ha.example.com"],
+        [1],
+        [None],
+        b"ha",
+        bytearray(b"ha"),
+        [bytearray(b"ha")],
+    ],
+)
+def test_ip_like_invalid_punycode_and_non_text_names_are_rejected_before_anything_is_written(
+    pki: ReporterPkiStore, names: Any
+) -> None:
+    with pytest.raises(ValueError):
+        pki.create(names)
+    assert not pki.ca_path.exists()
+
+
+@pytest.mark.parametrize("name", ["xn--bcher-kva.example", "server-a.example.com"])
+def test_valid_punycode_and_ordinary_names_are_accepted(pki: ReporterPkiStore, name: str) -> None:
+    assert pki.create([name]).dns_names == (name,)
+
+
+# --------------------------------------------------------------------------------------------------
+# expiry on first issuance
+# --------------------------------------------------------------------------------------------------
+
+
+def test_no_first_leaf_is_issued_under_an_expired_ca(pki: ReporterPkiStore, clock: Clock) -> None:
+    pki.create_ca()
+    clock.now = pki.load_ca().not_after
+
+    assert fault_of(lambda: pki.create_leaf(NAMES)) is StoreFault.CERTIFICATE_EXPIRED
+    assert not pki.leaf_path.exists()

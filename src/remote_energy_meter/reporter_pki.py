@@ -16,6 +16,8 @@ renewal (task 12.1), perform a CA transition (requirement 5.4), read operator fi
 Creation is two steps: the CA, then its first leaf. A crash between them leaves a CA and no leaf, which
 :meth:`ReporterPkiStore.load_leaf` reports as ``IDENTITY_MISSING``; :meth:`ReporterPkiStore.create_leaf` finishes it.
 
+The design is "native-computer-reporters design.md".
+
 Leaf host names are DNS names in canonical lowercase LDH form (no IP addresses). The reporter's server-identity host is
 supplied by the caller; this module only records and certifies it.
 """
@@ -90,16 +92,37 @@ _LABEL: Final = re.compile(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\Z")
 
 
 def _canonical_dns_names(names: Sequence[str]) -> tuple[str, ...]:
-    """Validate and sort DNS names: lowercase LDH labels, no IP-like or trailing-dot names, 1 to 8 distinct."""
-    if isinstance(names, str) or not 1 <= len(names) <= MAX_DNS_NAMES:
+    """Validate and sort DNS names.
+
+    ``names`` must be a list or tuple (not a ``str``, ``bytes``, or ``bytearray``) of 1 to 8 distinct entries, each
+    exactly a ``str``: lowercase LDH labels, no trailing dot, a last label that does not start with a digit (so no
+    decimal or hex IP-like name), and every ``xn--`` label must decode as IDNA.
+
+    Raises:
+        ValueError: ``names`` violates any rule above.
+    """
+    if not isinstance(names, list | tuple) or not 1 <= len(names) <= MAX_DNS_NAMES:
         raise ValueError(f"between 1 and {MAX_DNS_NAMES} DNS names are required")
     for name in names:
+        if type(name) is not str:
+            raise ValueError("a DNS name must be a string")
         labels = name.split(".")
-        if len(name) > 253 or not all(_LABEL.fullmatch(label) for label in labels) or labels[-1].isdigit():
+        if len(name) > 253 or not all(_LABEL.fullmatch(label) for label in labels) or labels[-1][0].isdigit():
             raise ValueError("a DNS name must be lowercase LDH labels and must not look like an IP address")
+        for label in labels:
+            if label.startswith("xn--") and not _is_valid_idna_label(label):
+                raise ValueError("a DNS name has an invalid internationalized label")
     if len(set(names)) != len(names):
         raise ValueError("DNS names must be distinct")
     return tuple(sorted(names))
+
+
+def _is_valid_idna_label(label: str) -> bool:
+    try:
+        decoded = label.encode("ascii").decode("idna")
+    except UnicodeError:
+        return False
+    return bool(decoded) and all(decoded.split("."))
 
 
 def _certificate_b64(certificate: x509.Certificate) -> str:
@@ -190,8 +213,9 @@ class ReporterPkiStore:
         keys: StateAuthenticationKeyStore,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
-        if ca_directory == leaf_directory:
-            raise ValueError("the CA and the leaf must be stored in different directories")
+        resolved_ca, resolved_leaf = ca_directory.resolve(), leaf_directory.resolve()
+        if resolved_ca.is_relative_to(resolved_leaf) or resolved_leaf.is_relative_to(resolved_ca):
+            raise ValueError("the CA and the leaf must be stored in different directories, neither inside the other")
         self._ca_directory = ca_directory
         self._leaf_directory = leaf_directory
         self._clock = clock
@@ -233,6 +257,7 @@ class ReporterPkiStore:
                 underlying stores. Use :meth:`create_leaf` to finish a creation interrupted after the CA.
         """
         names = _canonical_dns_names(dns_names)
+        ensure_private_directory(self._leaf_directory)  # fail before the CA exists if the leaf directory is unusable
         self.create_ca()
         return self.create_leaf(names)
 
@@ -269,7 +294,8 @@ class ReporterPkiStore:
         Raises:
             ValueError: ``dns_names`` is invalid.
             SecureStoreError: ``IDENTITY_MISSING`` without a CA; ``IDENTITY_EXISTS`` when a leaf already exists (it is
-                never replaced); ``CERTIFICATE_EXPIRED`` when the CA has expired; any other store fault.
+                never replaced); ``CERTIFICATE_EXPIRED`` when the CA has expired; ``MALFORMED`` for a stored record
+                of the wrong shape; any other store fault.
         """
         names = _canonical_dns_names(dns_names)
         ca = self.load_ca()
@@ -297,7 +323,11 @@ class ReporterPkiStore:
         Raises:
             ValueError: ``dns_names`` is invalid.
             SecureStoreError: ``IDENTITY_MISSING`` when no leaf (or CA) exists; ``CERTIFICATE_EXPIRED`` when the CA
-                has expired; ``IDENTITY_INCONSISTENT`` when the stored records disagree; any other store fault.
+                has expired; ``IDENTITY_INCONSISTENT`` when the stored records disagree; ``MALFORMED`` for a stored
+                record of the wrong shape; any other store fault.
+
+        The CA is loaded before the update lock is taken. If the CA is replaced in between, the new leaf is signed by
+        the old CA and :meth:`load_leaf` rejects it with ``IDENTITY_INCONSISTENT``, so the failure is closed.
         """
         names = None if dns_names is None else _canonical_dns_names(dns_names)
         ca = self.load_ca()
@@ -332,7 +362,8 @@ class ReporterPkiStore:
 
         Raises:
             SecureStoreError: ``IDENTITY_MISSING`` when no CA or leaf exists; ``IDENTITY_INCONSISTENT`` when the leaf
-                does not belong to the stored CA or its parts disagree; any fault of :meth:`load_ca` or the store.
+                does not belong to the stored CA or its parts disagree; ``MALFORMED`` for a record of the wrong shape;
+                any fault of :meth:`load_ca` or the store.
         """
         ca = self.load_ca()
         document = self._leaf_document.load()
@@ -391,7 +422,7 @@ class ReporterPkiStore:
             .issuer_name(x509.load_der_x509_certificate(ca.certificate_der).subject)
             .public_key(leaf_public)
             .serial_number(secrets.randbits(63) + 1)
-            .not_valid_before(now - CERTIFICATE_BACKDATE)
+            .not_valid_before(max(now - CERTIFICATE_BACKDATE, ca.not_before))
             .not_valid_after(min(now + LEAF_LIFETIME, ca.not_after))
             .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
             .add_extension(
@@ -468,7 +499,7 @@ class ReporterPkiStore:
             or spki_der(certificate_key) != spki_der(public_key)
             or certificate.subject != certificate.issuer
             or not isinstance(certificate.signature_hash_algorithm, hashes.SHA256)
-            or not self._is_ca(certificate)
+            or not self._is_ca_profile(certificate)
         ):
             raise SecureStoreError(StoreFault.IDENTITY_INCONSISTENT, f"{where}: CA certificate, key, and pin disagree")
         self._verify_signature(where, certificate, public_key)
@@ -515,7 +546,7 @@ class ReporterPkiStore:
             spki_identifier(public_key) != pin
             or not isinstance(certificate_key, ec.EllipticCurvePublicKey)
             or spki_der(certificate_key) != spki_der(public_key)
-            or self._is_ca(certificate)
+            or not self._is_leaf_profile(certificate, ca)
             or not isinstance(certificate.signature_hash_algorithm, hashes.SHA256)
             or self._dns_names(certificate) != names
         ):
@@ -544,11 +575,40 @@ class ReporterPkiStore:
         )
 
     @staticmethod
-    def _is_ca(certificate: x509.Certificate) -> bool:
+    def _is_ca_profile(certificate: x509.Certificate) -> bool:
         try:
-            return certificate.extensions.get_extension_for_class(x509.BasicConstraints).value.ca
+            basic = certificate.extensions.get_extension_for_class(x509.BasicConstraints)
+            usage = certificate.extensions.get_extension_for_class(x509.KeyUsage)
         except x509.ExtensionNotFound:
             return False
+        return (
+            basic.critical
+            and basic.value.ca
+            and basic.value.path_length == 0
+            and usage.critical
+            and usage.value.key_cert_sign
+        )
+
+    @staticmethod
+    def _is_leaf_profile(certificate: x509.Certificate, ca: ReporterCa) -> bool:
+        try:
+            basic = certificate.extensions.get_extension_for_class(x509.BasicConstraints)
+            usage = certificate.extensions.get_extension_for_class(x509.KeyUsage)
+            extended = certificate.extensions.get_extension_for_class(x509.ExtendedKeyUsage)
+            san = certificate.extensions.get_extension_for_class(x509.SubjectAlternativeName)
+        except x509.ExtensionNotFound:
+            return False
+        return (
+            basic.critical
+            and not basic.value.ca
+            and usage.critical
+            and usage.value.digital_signature
+            and not usage.value.key_cert_sign
+            and list(extended.value) == [ExtendedKeyUsageOID.SERVER_AUTH]
+            and all(isinstance(entry, x509.DNSName) for entry in san.value)
+            and ca.not_before <= certificate.not_valid_before_utc
+            and certificate.not_valid_after_utc <= ca.not_after
+        )
 
     @staticmethod
     def _dns_names(certificate: x509.Certificate) -> tuple[str, ...]:
