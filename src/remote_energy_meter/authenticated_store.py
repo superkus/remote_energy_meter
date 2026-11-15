@@ -21,7 +21,10 @@ tombstones) need tamper evidence as well. This module adds it:
   envelope. The tag is HMAC-SHA-256 under that key over a ``REM-TRANSCRIPT`` binding the store id, schema version,
   generation, and the canonical body bytes, so a record cannot be altered, copied into another store, or relabelled
   with another generation without the key. Before a save overwrites the current document, its tag is verified, so a
-  save never erases evidence of tampering.
+  save never erases evidence of tampering. Besides ``save``, it offers :meth:`~AuthenticatedDocumentStore.create`,
+  which writes generation 1 only if no document exists (an exclusive hard link, so a concurrent creator is never
+  overwritten), and :meth:`~AuthenticatedDocumentStore.update`, which hands the verified current record to a callback
+  and writes the result under the same store lock, so no other writer's change falls between read and write.
 
 What the tag cannot prove is freshness. It gives authenticity and binding to the store, schema version, and
 generation, and the key never rotates, so every record it ever tagged stays authentic. An older record restored on its
@@ -40,7 +43,7 @@ import hashlib
 import hmac
 import secrets
 import threading
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Final
 
@@ -307,6 +310,59 @@ class AuthenticatedDocumentStore:
                 return {"body": dict(body), "tag": encode_base64url(tag, exact_length=TAG_BYTES)}
 
             saved = self._document.save_with(build)
+            stored_body, _tag = self._split(saved)
+            return StoredDocument(generation=saved.generation, record=stored_body)
+
+    def create(self, body: Mapping[str, JsonValue]) -> StoredDocument:
+        """Tag ``body`` and write it as generation 1 only if no document exists; an existing one is never replaced.
+
+        The key is loaded first, so a missing key fails as ``KEY_MISSING`` with nothing written. An existing document is
+        verified before it is reported, so a tampered one fails with its own fault, not as an existing document. The
+        write is an exclusive hard link (:meth:`VersionedDocumentStore.create`), so a second writer that creates the
+        document after the check is never overwritten. The same unconfirmed-outcome rule as
+        :meth:`VersionedDocumentStore.save` applies after an ``IO_ERROR``.
+
+        Raises:
+            SecureStoreError: ``CONCURRENT_MODIFICATION`` when a verified document exists or another writer creates it
+                first; any fault of :meth:`StateAuthenticationKeyStore.load`; any other fault from :meth:`load`;
+                ``MALFORMED`` when ``body`` is not canonical-JSON renderable within the cap; ``IO_ERROR`` from the
+                write.
+        """
+        with self._lock:
+            key = self._keys.load()
+            existing = self._document.load()
+            if existing is not None:
+                self._verify(existing, key)
+                raise SecureStoreError(
+                    StoreFault.CONCURRENT_MODIFICATION, f"{self.path} already exists and is never replaced"
+                )
+            tag = key.tag(self._message(1, body))
+            created = self._document.create({"body": dict(body), "tag": encode_base64url(tag, exact_length=TAG_BYTES)})
+            stored_body, _tag = self._split(created)
+            return StoredDocument(generation=created.generation, record=stored_body)
+
+    def update(self, build: Callable[[StoredDocument | None], Mapping[str, JsonValue]]) -> StoredDocument:
+        """Write ``build(current)``, tagged, as the next generation; return the stored body.
+
+        ``current`` is the verified document exactly as this update re-read it under the store lock (``None`` if none
+        exists), so ``build`` derives the new body from the very record it replaces and no other writer's change can
+        fall between the read and the write. An exception from ``build`` writes nothing. The key is loaded first, so a
+        missing key fails as ``KEY_MISSING`` with nothing written. The same unconfirmed-outcome rule as
+        :meth:`VersionedDocumentStore.save` applies after an ``IO_ERROR``.
+
+        Raises:
+            SecureStoreError: The faults of :meth:`save`, plus any ``SecureStoreError`` raised by ``build``.
+        """
+        with self._lock:
+            key = self._keys.load()
+
+            def write(generation: int, raw: StoredDocument | None) -> Mapping[str, JsonValue]:
+                current = None if raw is None else self._verify(raw, key)
+                body = build(current)
+                tag = key.tag(self._message(generation, body))
+                return {"body": dict(body), "tag": encode_base64url(tag, exact_length=TAG_BYTES)}
+
+            saved = self._document.save_with(write)
             stored_body, _tag = self._split(saved)
             return StoredDocument(generation=saved.generation, record=stored_body)
 
