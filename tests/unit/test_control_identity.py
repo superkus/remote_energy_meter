@@ -3,18 +3,23 @@
 from __future__ import annotations
 
 import base64
+import copy
+import dataclasses
 import hashlib
+import json
+import os
+import pickle
 import stat
 from collections.abc import Callable
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 from cryptography import x509
-from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import ExtendedKeyUsageOID
+from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from remote_energy_meter import control_identity
 from remote_energy_meter.authenticated_store import AuthenticatedDocumentStore, StateAuthenticationKeyStore
@@ -26,7 +31,7 @@ from remote_energy_meter.control_identity import (
     ControlIdentity,
     ControlIdentityStore,
 )
-from remote_energy_meter.protocol_v1 import encode_base64url, render_canonical_json
+from remote_energy_meter.protocol_v1 import encode_base64url
 from remote_energy_meter.secure_store import SecureStoreError, StoreFault
 
 T0 = datetime(2030, 1, 1, 12, 0, 0, tzinfo=UTC)
@@ -369,14 +374,341 @@ def test_the_identity_lives_only_in_its_own_directory(
     assert sorted(entry.name for entry in tmp_path.iterdir()) == ["control", "keys"]
 
 
-def test_the_module_exports_its_public_names() -> None:
+# --------------------------------------------------------------------------------------------------
+# creation and renewal against concurrent writers
+# --------------------------------------------------------------------------------------------------
+
+
+def b64(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def test_create_never_overwrites_an_identity_another_writer_installs_after_the_check(
+    tmp_path: Path, keys: StateAuthenticationKeyStore, clock: Clock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = ControlIdentityStore(tmp_path / "control", keys=keys, clock=clock)
+    second = ControlIdentityStore(tmp_path / "control", keys=keys, clock=clock)
+    real_open = os.open
+    winner: list[ControlIdentity] = []
+    winner_bytes: list[bytes] = []
+
+    def race_before_file_creation(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if flags & os.O_CREAT and not winner:
+            winner.append(None)  # type: ignore[arg-type]  # recursion guard: the winner's create opens a file too
+            winner[0] = second.create()
+            winner_bytes.append(second.path.read_bytes())
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", race_before_file_creation)
+    fault = fault_of(first.create)
+    monkeypatch.undo()
+
+    assert winner_bytes, "the competing identity was never created"
+    assert fault is StoreFault.IDENTITY_EXISTS
+    assert first.path.read_bytes() == winner_bytes[0]
+    survivor = ControlIdentityStore(tmp_path / "control", keys=keys, clock=clock).load()
+    assert survivor == winner[0]
+
+
+def test_renewal_keeps_the_spki_generation_of_the_record_it_replaces(
+    store: ControlIdentityStore, keys: StateAuthenticationKeyStore, clock: Clock
+) -> None:
+    store.create()
+    fresh = replace_record(store, keys, spki_generation=2)
+    clock.now = T0 + timedelta(days=340)
+    fresh = ControlIdentityStore(store.path.parent, keys=keys, clock=clock)
+
+    renewed = fresh.renew()
+
+    assert renewed.spki_generation == 2
+    assert ControlIdentityStore(store.path.parent, keys=keys).load().spki_generation == 2
+
+
+def test_renewal_derives_from_the_record_on_disk_when_it_changed_after_the_key_was_read(
+    tmp_path: Path,
+    store: ControlIdentityStore,
+    keys: StateAuthenticationKeyStore,
+    clock: Clock,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A record replaced between the read and the write is renewed as it is, never reverted to the stale one."""
+    store.create()
+    replacement_store = ControlIdentityStore(tmp_path / "replacement", keys=keys, clock=clock)
+    replacement = replacement_store.create()
+    replacement_document = AuthenticatedDocumentStore(
+        replacement_store.path.parent,
+        DOCUMENT_NAME,
+        store_id="control-identity",
+        schema_version=1,
+        max_bytes=8192,
+        keys=keys,
+    )
+    loaded = replacement_document.load()
+    assert loaded is not None
+    new_body = {**loaded.record, "spki_generation": 2}
+    # The inner versioned document of the store under test: the same instance, so the replacement is "its own write".
+    inner = store._document._document
+    real_load = keys.load
+    fired: list[bool] = []
+
+    def load_then_replace() -> Any:
+        key = real_load()
+        if not fired:
+            fired.append(True)
+            tag = key.tag(store._document._message(2, new_body))
+            inner.save({"body": new_body, "tag": encode_base64url(tag, exact_length=32)})
+        return key
+
+    monkeypatch.setattr(keys, "load", load_then_replace)
+    clock.now = T0 + timedelta(days=340)
+
+    renewed = store.renew()
+    monkeypatch.undo()
+
+    assert fired
+    assert renewed.spki_sha256 == replacement.spki_sha256
+    assert renewed.spki_generation == 2
+    on_disk = ControlIdentityStore(store.path.parent, keys=keys).load()
+    assert on_disk.spki_sha256 == replacement.spki_sha256
+    assert on_disk.spki_generation == 2
+    assert on_disk.private_key().private_numbers() == replacement.private_key().private_numbers()
+
+
+def test_renewing_a_missing_identity_writes_nothing(store: ControlIdentityStore) -> None:
+    assert fault_of(store.renew) is StoreFault.IDENTITY_MISSING
+    assert not store.path.exists()
+
+
+# --------------------------------------------------------------------------------------------------
+# the private key stays inside the identity
+# --------------------------------------------------------------------------------------------------
+
+
+def test_an_identity_cannot_be_exported_by_asdict_astuple_pickle_or_copy(store: ControlIdentityStore) -> None:
+    identity = store.create()
+
+    for export in (
+        lambda: dataclasses.asdict(identity),
+        lambda: dataclasses.astuple(identity),
+        lambda: pickle.dumps(identity),
+        lambda: copy.copy(identity),
+        lambda: copy.deepcopy(identity),
+    ):
+        with pytest.raises(TypeError):
+            export()
+
+
+def test_neither_repr_nor_str_shows_the_private_scalar(store: ControlIdentityStore) -> None:
+    identity = store.create()
+    scalar = identity.private_key().private_numbers().private_value.to_bytes(32, "big")
+
+    for rendered in (repr(identity), str(identity), repr(identity.private_key_pkcs8_der) + repr(identity)):
+        assert scalar.hex() not in rendered
+        assert b64(scalar) not in rendered
+        assert str(int.from_bytes(scalar, "big")) not in rendered
+
+
+def test_an_identity_cannot_be_modified(store: ControlIdentityStore) -> None:
+    identity = store.create()
+    pin = identity.spki_sha256
+
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        identity.spki_sha256 = "x"  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        identity.spki_generation = 2  # type: ignore[misc]
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        identity._scalar = None  # type: ignore[assignment,misc]
+    assert not hasattr(identity, "__dict__")  # slotted: no side channel for extra attributes
+    assert identity.spki_sha256 == pin
+
+
+# --------------------------------------------------------------------------------------------------
+# what _decode accepts: only a self-signed, SHA-256, end-entity certificate of the stored key
+# --------------------------------------------------------------------------------------------------
+
+
+def build_certificate(
+    private_key: ec.EllipticCurvePrivateKey,
+    *,
+    issuer_name: str = "Remote Energy Meter control",
+    algorithm: hashes.SHA256 | hashes.SHA384 | None = None,
+    ca: bool | None = False,
+    padding: int = 0,
+) -> bytes:
+    """A certificate for ``private_key`` signed by it, valid in every respect except the one the caller varies."""
+    subject = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Remote Energy Meter control")])
+    issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, issuer_name)])
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(subject)
+        .issuer_name(issuer)
+        .public_key(private_key.public_key())
+        .serial_number(7)
+        .not_valid_before(T0 - CERTIFICATE_BACKDATE)
+        .not_valid_after(T0 + CERTIFICATE_LIFETIME)
+    )
+    if ca is not None:
+        builder = builder.add_extension(x509.BasicConstraints(ca=ca, path_length=None), critical=True)
+    if padding:
+        builder = builder.add_extension(
+            x509.UnrecognizedExtension(x509.ObjectIdentifier("1.3.6.1.4.1.99999.1"), b"\x00" * padding), critical=False
+        )
+    certificate = builder.sign(private_key, algorithm or hashes.SHA256())
+    return certificate.public_bytes(serialization.Encoding.DER)
+
+
+def store_with_certificate(
+    store: ControlIdentityStore, keys: StateAuthenticationKeyStore, certificate_der: bytes
+) -> ControlIdentityStore:
+    return replace_record(store, keys, certificate_der=b64(certificate_der))
+
+
+def test_a_hand_built_certificate_of_the_stored_key_is_accepted_as_the_baseline(
+    store: ControlIdentityStore, keys: StateAuthenticationKeyStore
+) -> None:
+    identity = store.create()
+    fresh = store_with_certificate(store, keys, build_certificate(identity.private_key()))
+
+    assert fresh.load().spki_sha256 == identity.spki_sha256
+
+
+def test_a_certificate_issued_by_another_name_but_signed_by_the_stored_key_is_inconsistent(
+    store: ControlIdentityStore, keys: StateAuthenticationKeyStore
+) -> None:
+    identity = store.create()
+    der = build_certificate(identity.private_key(), issuer_name="Some other issuer")
+
+    assert fault_of(store_with_certificate(store, keys, der).load) is StoreFault.IDENTITY_INCONSISTENT
+
+
+def test_a_certificate_signed_with_a_hash_other_than_sha256_is_inconsistent(
+    store: ControlIdentityStore, keys: StateAuthenticationKeyStore
+) -> None:
+    identity = store.create()
+    der = build_certificate(identity.private_key(), algorithm=hashes.SHA384())
+
+    assert fault_of(store_with_certificate(store, keys, der).load) is StoreFault.IDENTITY_INCONSISTENT
+
+
+def test_a_ca_certificate_is_inconsistent(store: ControlIdentityStore, keys: StateAuthenticationKeyStore) -> None:
+    identity = store.create()
+    der = build_certificate(identity.private_key(), ca=True)
+
+    assert fault_of(store_with_certificate(store, keys, der).load) is StoreFault.IDENTITY_INCONSISTENT
+
+
+def test_a_certificate_without_basic_constraints_is_inconsistent(
+    store: ControlIdentityStore, keys: StateAuthenticationKeyStore
+) -> None:
+    identity = store.create()
+    der = build_certificate(identity.private_key(), ca=None)
+
+    assert fault_of(store_with_certificate(store, keys, der).load) is StoreFault.IDENTITY_INCONSISTENT
+
+
+CURVE_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+
+
+@pytest.mark.parametrize("scalar", [CURVE_ORDER, CURVE_ORDER + 1, 2**256 - 1])
+def test_a_private_scalar_at_or_above_the_curve_order_is_malformed(
+    store: ControlIdentityStore, keys: StateAuthenticationKeyStore, scalar: int
+) -> None:
+    store.create()
+    fresh = replace_record(store, keys, private_scalar=b64(scalar.to_bytes(32, "big")))
+
+    assert fault_of(fresh.load) is StoreFault.MALFORMED
+
+
+def test_a_certificate_over_the_size_bound_is_malformed_even_when_it_is_otherwise_valid(
+    store: ControlIdentityStore, keys: StateAuthenticationKeyStore
+) -> None:
+    identity = store.create()
+    within = build_certificate(identity.private_key(), padding=3000)
+    over = build_certificate(identity.private_key(), padding=4200)
+    assert len(within) <= 4096 < len(over)
+
+    assert store_with_certificate(store, keys, within).load().spki_sha256 == identity.spki_sha256
+    assert fault_of(store_with_certificate(store, keys, over).load) is StoreFault.MALFORMED
+
+
+# --------------------------------------------------------------------------------------------------
+# time zones
+# --------------------------------------------------------------------------------------------------
+
+
+def test_needs_renewal_refuses_a_naive_datetime(store: ControlIdentityStore) -> None:
+    identity = store.create()
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        identity.needs_renewal(datetime(2030, 1, 1, 12, 0, 0))  # noqa: DTZ001 - the naive value is the input under test
+
+
+def test_a_naive_clock_is_refused_by_create_and_writes_nothing(
+    tmp_path: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    naive = ControlIdentityStore(
+        tmp_path / "control",
+        keys=keys,
+        clock=lambda: datetime(2030, 1, 1, 12, 0, 0),  # noqa: DTZ001
+    )
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        naive.create()
+    assert not naive.path.exists()
+
+
+def test_a_naive_clock_is_refused_by_renew_and_keeps_the_record(
+    store: ControlIdentityStore, keys: StateAuthenticationKeyStore
+) -> None:
+    store.create()
+    before = store.path.read_bytes()
+    naive = ControlIdentityStore(
+        store.path.parent,
+        keys=keys,
+        clock=lambda: datetime(2030, 6, 1, 12, 0, 0),  # noqa: DTZ001
+    )
+
+    with pytest.raises(ValueError, match="timezone-aware"):
+        naive.renew()
+    assert store.path.read_bytes() == before
+
+
+def test_a_clock_in_another_time_zone_issues_the_same_instant(
+    tmp_path: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    offset = timezone(timedelta(hours=5, minutes=30))
+    shifted = ControlIdentityStore(tmp_path / "control", keys=keys, clock=lambda: T0.astimezone(offset))
+
+    identity = shifted.create()
+
+    assert identity.not_before == T0 - CERTIFICATE_BACKDATE
+    assert identity.not_after == T0 + CERTIFICATE_LIFETIME
+
+
+# --------------------------------------------------------------------------------------------------
+# the stored record and the module's surface
+# --------------------------------------------------------------------------------------------------
+
+
+def test_the_module_exports_exactly_its_documented_names() -> None:
+    assert set(control_identity.__all__) == {
+        "CERTIFICATE_BACKDATE",
+        "CERTIFICATE_LIFETIME",
+        "DOCUMENT_NAME",
+        "RENEW_BEFORE_EXPIRY",
+        "ControlIdentity",
+        "ControlIdentityStore",
+    }
     for name in control_identity.__all__:
         assert hasattr(control_identity, name)
-    assert ControlIdentity.__slots__ is not None  # frozen slotted dataclass
 
 
-def test_the_renderer_and_record_keys_are_the_documented_set(store: ControlIdentityStore) -> None:
-    store.create()
-    envelope = render_canonical_json({}, max_depth=1)
-    assert envelope == b"{}"
-    assert b'"spki_sha256"' in store.path.read_bytes()
+def test_the_stored_record_has_exactly_the_documented_keys_and_no_more(store: ControlIdentityStore) -> None:
+    identity = store.create()
+    envelope = json.loads(store.path.read_bytes())
+    record = envelope["record"]
+
+    assert set(record) == {"body", "tag"}
+    assert set(record["body"]) == {"certificate_der", "private_scalar", "spki_generation", "spki_sha256"}
+    assert record["body"]["spki_sha256"] == identity.spki_sha256
+    assert record["body"]["spki_generation"] == 1

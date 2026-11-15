@@ -7,13 +7,21 @@ change it, and routine certificate renewal reuses the key, so it never changes t
 
 This module owns only that identity's durable record:
 
-* :meth:`ControlIdentityStore.create` generates the key and the first certificate, once.
-* :meth:`ControlIdentityStore.renew` issues a fresh certificate under the *same* key and SPKI.
+* :meth:`ControlIdentityStore.create` generates the key and the first certificate, once, writing exclusively so a
+  concurrent creator's identity is never overwritten (it gets ``IDENTITY_EXISTS``).
+* :meth:`ControlIdentityStore.renew` issues a fresh certificate under the *same* key and SPKI, reading and replacing
+  the record in one locked update of the authenticated store, so the key and generation come from the record being
+  replaced.
 * :meth:`ControlIdentityStore.load` verifies, on every call, that the certificate is self-signed by the stored key and
   that the stored identifier is the hash of that key's SPKI, and fails closed otherwise.
 
 Planned SPKI rotation, recovery revocation, and the generations they advance belong to the control-authority work. The
-``spki_generation`` stored here is the generation of this key (always ``1`` until a rotation replaces it).
+``spki_generation`` stored here is the generation of this key (always ``1`` until planned rotation exists and
+replaces it).
+
+The private key is never exposed for export beyond :meth:`ControlIdentity.private_key` and
+:meth:`ControlIdentity.private_key_pkcs8_der`: pickling, copying, and ``dataclasses.asdict`` of an identity are
+refused with ``TypeError``, and the key never appears in ``repr`` or ``str``.
 
 The certificate carries no subject alternative name: control peers verify the exact SPKI pin, not a host name, and the
 endpoint's address is deliberately not recorded. It is a TLS server certificate (``serverAuth``) valid for one year,
@@ -26,12 +34,10 @@ or replayed record fails authentication, and it sits in its own owner-only direc
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import secrets
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Final
@@ -44,7 +50,8 @@ from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from remote_energy_meter.authenticated_store import AuthenticatedDocumentStore, StateAuthenticationKeyStore
 from remote_energy_meter.protocol_v1 import JsonValue, ProtocolViolation, decode_base64url, encode_base64url
-from remote_energy_meter.secure_store import SecureStoreError, StoreFault, ensure_private_directory
+from remote_energy_meter.protocol_v1.encoding import decode_opaque_base64url
+from remote_energy_meter.secure_store import SecureStoreError, StoredDocument, StoreFault, ensure_private_directory
 
 __all__ = [
     "CERTIFICATE_BACKDATE",
@@ -68,6 +75,7 @@ _SCHEMA_VERSION: Final = 1
 _MAX_BYTES: Final = 8192
 _SCALAR_BYTES: Final = 32
 _HASH_BYTES: Final = 32
+_MAX_CERTIFICATE_BYTES: Final = 4096
 _RECORD_KEYS: Final = frozenset({"certificate_der", "private_scalar", "spki_generation", "spki_sha256"})
 _COMMON_NAME: Final = "Remote Energy Meter control"
 
@@ -80,24 +88,42 @@ def _spki_identifier(public_key: ec.EllipticCurvePublicKey) -> str:
     return encode_base64url(hashlib.sha256(_spki_der(public_key)).digest(), exact_length=_HASH_BYTES)
 
 
-def _encode_blob(value: bytes) -> str:
-    return base64.urlsafe_b64encode(value).rstrip(b"=").decode("ascii")
+def _scalar_bytes(private_key: ec.EllipticCurvePrivateKey) -> bytes:
+    return private_key.private_numbers().private_value.to_bytes(_SCALAR_BYTES, "big")
 
 
-def _decode_blob(text: str) -> bytes:
-    """Decode unpadded base64url strictly: only the canonical encoding of the bytes is accepted."""
-    try:
-        raw = base64.urlsafe_b64decode(text + "=" * (-len(text) % 4))
-    except (binascii.Error, ValueError):
-        raise ValueError("not base64url") from None
-    if _encode_blob(raw) != text:
-        raise ValueError("not canonical base64url")
-    return raw
+class _PrivateScalar:
+    """The 32-byte private scalar. It never appears in ``repr``, ``str``, copies, or pickles."""
+
+    __slots__ = ("_value",)
+
+    def __init__(self, value: bytes) -> None:
+        if type(value) is not bytes or len(value) != _SCALAR_BYTES:
+            raise ValueError(f"a control private scalar is exactly {_SCALAR_BYTES} bytes")
+        self._value = value
+
+    def key(self) -> ec.EllipticCurvePrivateKey:
+        return ec.derive_private_key(int.from_bytes(self._value, "big"), ec.SECP256R1())
+
+    def __repr__(self) -> str:
+        return "_PrivateScalar(<redacted>)"
+
+    __str__ = __repr__
+
+    def __reduce__(self) -> str | tuple[object, ...]:
+        raise TypeError("a control private key cannot be pickled")
+
+    def __copy__(self) -> _PrivateScalar:
+        raise TypeError("a control private key cannot be copied")
+
+    def __deepcopy__(self, memo: object) -> _PrivateScalar:
+        raise TypeError("a control private key cannot be copied")
 
 
 @dataclass(frozen=True, slots=True)
 class ControlIdentity:
-    """The loaded control identity. The private key never appears in ``repr``."""
+    """The loaded control identity. The private key sits in an opaque holder that never appears in ``repr``, and that
+    refuses copying, ``dataclasses.asdict``, and pickling."""
 
     spki_sha256: str
     """Canonical base64url SHA-256 of the DER SubjectPublicKeyInfo: the pin peers verify."""
@@ -105,11 +131,21 @@ class ControlIdentity:
     certificate_der: bytes = field(repr=False)
     not_before: datetime
     not_after: datetime
-    _private_scalar: bytes = field(repr=False)
+    private_scalar: InitVar[bytes]
+    _scalar: _PrivateScalar = field(init=False, repr=False, compare=False)
+
+    def __post_init__(self, private_scalar: bytes) -> None:
+        object.__setattr__(self, "_scalar", _PrivateScalar(private_scalar))
+
+    def __reduce__(self) -> str | tuple[object, ...]:
+        raise TypeError("a control identity cannot be pickled or copied")
+
+    def __reduce_ex__(self, protocol: object) -> str | tuple[object, ...]:
+        raise TypeError("a control identity cannot be pickled or copied")
 
     def private_key(self) -> ec.EllipticCurvePrivateKey:
         """Return the control TLS private key. Hand it only to the control TLS edge."""
-        return ec.derive_private_key(int.from_bytes(self._private_scalar, "big"), ec.SECP256R1())
+        return self._scalar.key()
 
     def private_key_pkcs8_der(self) -> bytes:
         """Return the private key as unencrypted PKCS#8 DER, for the control edge's own owner-only key file."""
@@ -119,6 +155,8 @@ class ControlIdentity:
 
     def needs_renewal(self, now: datetime) -> bool:
         """Whether less than :data:`RENEW_BEFORE_EXPIRY` of the certificate's validity remains at ``now``."""
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise ValueError("now must be a timezone-aware datetime")
         return now >= self.not_after - RENEW_BEFORE_EXPIRY
 
 
@@ -157,32 +195,50 @@ class ControlIdentityStore:
     def create(self) -> ControlIdentity:
         """Generate the key and first certificate and store them, once.
 
+        The record is written exclusively, so an identity another writer creates concurrently is never overwritten.
+
         Raises:
-            SecureStoreError: ``IDENTITY_EXISTS`` when an identity already exists (it is never replaced); any fault
-                of the underlying store, including ``KEY_MISSING`` without a state-authentication key.
+            SecureStoreError: ``IDENTITY_EXISTS`` when an identity already exists, including one created while this
+                call runs (it is never replaced); any other fault of the underlying store, including ``KEY_MISSING``
+                without a state-authentication key and the tamper fault of an existing record that does not verify.
         """
         ensure_private_directory(self._directory)
         if self._document.load() is not None:
             raise SecureStoreError(StoreFault.IDENTITY_EXISTS, f"{self.path} already exists and is never replaced")
         private_key = ec.generate_private_key(ec.SECP256R1())
         certificate = self._issue(private_key)
-        self._document.save(self._record(private_key, certificate, spki_generation=1))
+        try:
+            self._document.create(self._record(private_key, certificate, spki_generation=1))
+        except SecureStoreError as error:
+            if error.fault is StoreFault.CONCURRENT_MODIFICATION:
+                detail = f"{self.path} was created by another writer and is never replaced"
+                raise SecureStoreError(StoreFault.IDENTITY_EXISTS, detail) from None
+            raise
         return self._identity(private_key, certificate, spki_generation=1)
 
     def renew(self) -> ControlIdentity:
         """Issue a new certificate under the same key and store it; the SPKI and its generation do not change.
 
+        The current record is read, verified, and replaced under one store lock, so the key and generation come from the
+        very record being replaced and a record changed by another writer is never overwritten with stale values.
+
         Raises:
-            SecureStoreError: ``IDENTITY_MISSING`` when none exists; any fault of :meth:`load`.
+            SecureStoreError: ``IDENTITY_MISSING`` when none exists; ``IDENTITY_INCONSISTENT`` when the record's parts
+                disagree or renewal would change the SPKI; any other fault of :meth:`load`.
         """
-        current = self.load()
-        private_key = current.private_key()
-        certificate = self._issue(private_key)
-        renewed = self._identity(private_key, certificate, spki_generation=current.spki_generation)
-        if renewed.spki_sha256 != current.spki_sha256:
-            raise SecureStoreError(StoreFault.IDENTITY_INCONSISTENT, "renewal would change the control SPKI")
-        self._document.save(self._record(private_key, certificate, spki_generation=current.spki_generation))
-        return renewed
+
+        def reissue(current: StoredDocument | None) -> Mapping[str, JsonValue]:
+            if current is None:
+                raise SecureStoreError(StoreFault.IDENTITY_MISSING, f"{self.path} does not exist")
+            identity = self._decode(current.record)
+            private_key = identity.private_key()
+            certificate = self._issue(private_key)
+            renewed = self._identity(private_key, certificate, spki_generation=identity.spki_generation)
+            if renewed.spki_sha256 != identity.spki_sha256:
+                raise SecureStoreError(StoreFault.IDENTITY_INCONSISTENT, "renewal would change the control SPKI")
+            return self._record(private_key, certificate, spki_generation=identity.spki_generation)
+
+        return self._decode(self._document.update(reissue).record)
 
     def load(self) -> ControlIdentity:
         """Read and fully verify the identity.
@@ -200,7 +256,10 @@ class ControlIdentityStore:
     # -- internals --------------------------------------------------------------------------------
 
     def _issue(self, private_key: ec.EllipticCurvePrivateKey) -> x509.Certificate:
-        now = self._clock().astimezone(UTC)
+        clock_now = self._clock()
+        if clock_now.tzinfo is None or clock_now.utcoffset() is None:
+            raise ValueError("clock must return a timezone-aware datetime")
+        now = clock_now.astimezone(UTC)
         name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, _COMMON_NAME)])
         return (
             x509.CertificateBuilder()
@@ -232,10 +291,10 @@ class ControlIdentityStore:
     def _record(
         self, private_key: ec.EllipticCurvePrivateKey, certificate: x509.Certificate, *, spki_generation: int
     ) -> Mapping[str, JsonValue]:
-        scalar = private_key.private_numbers().private_value.to_bytes(_SCALAR_BYTES, "big")
+        certificate_der = certificate.public_bytes(serialization.Encoding.DER)
         return {
-            "certificate_der": _encode_blob(certificate.public_bytes(serialization.Encoding.DER)),
-            "private_scalar": encode_base64url(scalar, exact_length=_SCALAR_BYTES),
+            "certificate_der": encode_base64url(certificate_der, exact_length=len(certificate_der)),
+            "private_scalar": encode_base64url(_scalar_bytes(private_key), exact_length=_SCALAR_BYTES),
             "spki_generation": spki_generation,
             "spki_sha256": _spki_identifier(private_key.public_key()),
         }
@@ -243,14 +302,13 @@ class ControlIdentityStore:
     def _identity(
         self, private_key: ec.EllipticCurvePrivateKey, certificate: x509.Certificate, *, spki_generation: int
     ) -> ControlIdentity:
-        scalar = private_key.private_numbers().private_value.to_bytes(_SCALAR_BYTES, "big")
         return ControlIdentity(
             spki_sha256=_spki_identifier(private_key.public_key()),
             spki_generation=spki_generation,
             certificate_der=certificate.public_bytes(serialization.Encoding.DER),
             not_before=certificate.not_valid_before_utc,
             not_after=certificate.not_valid_after_utc,
-            _private_scalar=scalar,
+            private_scalar=_scalar_bytes(private_key),
         )
 
     def _decode(self, record: Mapping[str, JsonValue]) -> ControlIdentity:
@@ -269,7 +327,9 @@ class ControlIdentityStore:
         try:
             scalar = decode_base64url(encoded_scalar, exact_length=_SCALAR_BYTES)
             decode_base64url(encoded_spki, exact_length=_HASH_BYTES)
-            certificate = x509.load_der_x509_certificate(_decode_blob(encoded_cert))
+            certificate = x509.load_der_x509_certificate(
+                decode_opaque_base64url(encoded_cert, minimum=1, maximum=_MAX_CERTIFICATE_BYTES)
+            )
             private_key = ec.derive_private_key(int.from_bytes(scalar, "big"), ec.SECP256R1())
         except (ProtocolViolation, ValueError):
             raise SecureStoreError(
@@ -287,9 +347,17 @@ class ControlIdentityStore:
                 StoreFault.IDENTITY_INCONSISTENT, f"{self.path}: certificate, key, and identifier disagree"
             )
         algorithm = certificate.signature_hash_algorithm
-        if algorithm is None:
+        if not isinstance(algorithm, hashes.SHA256):
             raise SecureStoreError(
-                StoreFault.IDENTITY_INCONSISTENT, f"{self.path}: the certificate has no hash algorithm"
+                StoreFault.IDENTITY_INCONSISTENT, f"{self.path}: the certificate is not signed with SHA-256"
+            )
+        try:
+            constraints = certificate.extensions.get_extension_for_class(x509.BasicConstraints).value
+        except x509.ExtensionNotFound:
+            constraints = None
+        if constraints is None or constraints.ca:
+            raise SecureStoreError(
+                StoreFault.IDENTITY_INCONSISTENT, f"{self.path}: the certificate is not an end-entity certificate"
             )
         try:
             public_key.verify(certificate.signature, certificate.tbs_certificate_bytes, ec.ECDSA(algorithm))

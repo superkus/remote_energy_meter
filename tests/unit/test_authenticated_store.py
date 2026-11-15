@@ -23,7 +23,7 @@ from remote_energy_meter.authenticated_store import (
     StateAuthenticationKeyStore,
 )
 from remote_energy_meter.protocol_v1 import JsonValue, encode_base64url, render_canonical_json
-from remote_energy_meter.secure_store import SecureStoreError, StoreFault, ensure_private_directory
+from remote_energy_meter.secure_store import SecureStoreError, StoredDocument, StoreFault, ensure_private_directory
 
 STORE_ID = "control-authority"
 NAME = "authority.json"
@@ -631,3 +631,235 @@ def test_create_after_seeing_no_key_reports_a_key_created_meanwhile_as_existing(
     assert (key_dir / KEY_DOCUMENT_NAME).read_bytes() == winner
     message = b"same message for both keys"
     assert StateAuthenticationKeyStore(key_dir).load().tag(message) == winner_key.tag(message)
+
+
+# --------------------------------------------------------------------------------------------------
+# create (exclusive) and update (callback over the verified current record)
+# --------------------------------------------------------------------------------------------------
+
+
+def test_create_writes_generation_one_that_reloads_in_a_fresh_instance(
+    record_dir: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    created = make_store(record_dir, keys).create({"value": 1})
+    loaded = make_store(record_dir, StateAuthenticationKeyStore(keys.directory)).load()
+
+    assert (created.generation, dict(created.record)) == (1, {"value": 1})
+    assert loaded is not None
+    assert (loaded.generation, dict(loaded.record)) == (1, {"value": 1})
+    assert set(read_envelope(saved_path(record_dir))["record"]) == {"body", "tag"}
+
+
+def test_create_without_its_key_writes_nothing(record_dir: Path, key_dir: Path) -> None:
+    store = make_store(record_dir, StateAuthenticationKeyStore(key_dir))
+
+    assert fault_of(lambda: store.create({"value": 1})) is StoreFault.KEY_MISSING
+    assert not store.path.exists()
+
+
+def test_create_over_an_existing_record_reports_it_and_replaces_nothing(
+    record_dir: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    store = make_store(record_dir, keys)
+    store.create({"value": 1})
+    before = store.path.read_bytes()
+
+    assert fault_of(lambda: store.create({"value": 2})) is StoreFault.CONCURRENT_MODIFICATION
+    assert fault_of(lambda: make_store(record_dir, keys).create({"value": 2})) is StoreFault.CONCURRENT_MODIFICATION
+    assert store.path.read_bytes() == before
+
+
+def test_create_over_a_tampered_record_fails_verification_not_as_existing(
+    record_dir: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    make_store(record_dir, keys).create({"value": 1})
+    envelope = read_envelope(saved_path(record_dir))
+    envelope["record"]["body"]["value"] = 2
+    write_envelope(saved_path(record_dir), envelope)
+    tampered = saved_path(record_dir).read_bytes()
+
+    assert fault_of(lambda: make_store(record_dir, keys).create({"value": 3})) is StoreFault.AUTHENTICATION_FAILED
+    assert saved_path(record_dir).read_bytes() == tampered
+
+
+def test_create_never_overwrites_a_record_another_writer_installs_after_the_check(
+    record_dir: Path, keys: StateAuthenticationKeyStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first, second = make_store(record_dir, keys), make_store(record_dir, keys)
+    real_open = os.open
+    winner_bytes: list[bytes] = []
+
+    def race_before_file_creation(path: Any, flags: int, *args: Any, **kwargs: Any) -> int:
+        if flags & os.O_CREAT and not winner_bytes:
+            winner_bytes.append(b"")  # recursion guard: the winner's own create opens a file too
+            second.create({"value": "winner"})
+            winner_bytes[0] = second.path.read_bytes()
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", race_before_file_creation)
+    fault = fault_of(lambda: first.create({"value": "loser"}))
+    monkeypatch.undo()
+
+    assert winner_bytes[0], "the competing record was never created"
+    assert fault is StoreFault.CONCURRENT_MODIFICATION
+    assert first.path.read_bytes() == winner_bytes[0]
+    loaded = make_store(record_dir, StateAuthenticationKeyStore(keys.directory)).load()
+    assert loaded is not None
+    assert dict(loaded.record) == {"value": "winner"}
+
+
+def test_update_on_a_missing_record_sees_none_and_writes_generation_one(
+    record_dir: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    seen: list[object] = []
+
+    def build(current: StoredDocument | None) -> dict[str, JsonValue]:
+        seen.append(current)
+        return {"value": 1}
+
+    saved = make_store(record_dir, keys).update(build)
+
+    assert seen == [None]
+    assert (saved.generation, dict(saved.record)) == (1, {"value": 1})
+
+
+def test_update_hands_the_callback_the_verified_current_record_and_advances_the_generation(
+    record_dir: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    store = make_store(record_dir, keys)
+    store.save({"value": 1})
+    seen: list[tuple[int, dict[str, JsonValue]]] = []
+
+    def build(current: StoredDocument | None) -> dict[str, JsonValue]:
+        assert current is not None
+        seen.append((current.generation, dict(current.record)))
+        value = current.record["value"]
+        assert type(value) is int
+        return {"value": value + 1}
+
+    first = store.update(build)
+    second = make_store(record_dir, StateAuthenticationKeyStore(keys.directory)).update(build)
+
+    assert seen == [(1, {"value": 1}), (2, {"value": 2})]
+    assert (first.generation, dict(first.record)) == (2, {"value": 2})
+    assert (second.generation, dict(second.record)) == (3, {"value": 3})
+    reloaded = make_store(record_dir, StateAuthenticationKeyStore(keys.directory)).load()
+    assert reloaded is not None
+    assert (reloaded.generation, dict(reloaded.record)) == (3, {"value": 3})
+
+
+def test_update_tags_the_body_under_the_generation_it_is_stored_at(
+    record_dir: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    store = make_store(record_dir, keys)
+    store.update(lambda _current: {"value": 1})
+    store.update(lambda _current: {"value": 2})
+
+    envelope = read_envelope(saved_path(record_dir))
+    envelope["generation"] = 1  # relabelled with another generation: the tag must no longer verify
+    write_envelope(saved_path(record_dir), envelope)
+
+    assert fault_of(make_store(record_dir, keys).load) is StoreFault.AUTHENTICATION_FAILED
+
+
+def test_update_without_its_key_never_calls_back_and_writes_nothing(record_dir: Path, key_dir: Path) -> None:
+    calls: list[object] = []
+    store = make_store(record_dir, StateAuthenticationKeyStore(key_dir))
+
+    def build(current: StoredDocument | None) -> dict[str, JsonValue]:
+        calls.append(current)
+        return {"value": 1}
+
+    assert fault_of(lambda: store.update(build)) is StoreFault.KEY_MISSING
+    assert calls == []
+    assert not store.path.exists()
+
+
+def test_update_over_a_tampered_record_never_calls_back_and_keeps_the_record(
+    record_dir: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    make_store(record_dir, keys).save({"value": 1})
+    envelope = read_envelope(saved_path(record_dir))
+    envelope["record"]["body"]["value"] = 2
+    write_envelope(saved_path(record_dir), envelope)
+    tampered = saved_path(record_dir).read_bytes()
+    calls: list[object] = []
+
+    def build(current: StoredDocument | None) -> dict[str, JsonValue]:
+        calls.append(current)
+        return {"value": 3}
+
+    assert fault_of(lambda: make_store(record_dir, keys).update(build)) is StoreFault.AUTHENTICATION_FAILED
+    assert calls == []
+    assert saved_path(record_dir).read_bytes() == tampered
+
+
+def test_an_exception_in_the_update_callback_writes_nothing(
+    record_dir: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    store = make_store(record_dir, keys)
+
+    def refuse(_current: StoredDocument | None) -> dict[str, JsonValue]:
+        raise RuntimeError("callback failed")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        store.update(refuse)
+    assert not store.path.exists()
+
+    store.save({"value": 1})
+    before = store.path.read_bytes()
+    with pytest.raises(RuntimeError, match="callback failed"):
+        store.update(refuse)
+    assert store.path.read_bytes() == before
+    assert store.save({"value": 2}).generation == 2  # the failed update did not consume a generation
+
+
+def test_an_update_callback_error_from_the_store_layer_passes_through_unchanged(
+    record_dir: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    store = make_store(record_dir, keys)
+    store.save({"value": 1})
+
+    def refuse(_current: StoredDocument | None) -> dict[str, JsonValue]:
+        raise SecureStoreError(StoreFault.IDENTITY_MISSING, "no record")
+
+    assert fault_of(lambda: store.update(refuse)) is StoreFault.IDENTITY_MISSING
+
+
+def test_an_update_with_an_unrenderable_body_writes_nothing(
+    record_dir: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    store = make_store(record_dir, keys, max_bytes=512)
+    store.save({"value": 1})
+    before = store.path.read_bytes()
+
+    assert fault_of(lambda: store.update(lambda _current: {"value": "x" * 600})) is StoreFault.MALFORMED
+    assert store.path.read_bytes() == before
+
+
+def test_an_update_never_overwrites_a_record_tampered_with_during_the_update(
+    record_dir: Path, keys: StateAuthenticationKeyStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The callback only ever sees a verified record: a same-generation edit after the key load is caught."""
+    store = make_store(record_dir, keys)
+    store.save({"value": 1})
+    tampered = read_envelope(store.path)
+    tampered["record"]["body"]["value"] = 2
+    tampered_bytes = render_canonical_json(tampered, max_depth=16)
+    real_load = keys.load
+    calls: list[object] = []
+
+    def load_then_tamper() -> StateAuthenticationKey:
+        key = real_load()
+        write_envelope(store.path, tampered)
+        return key
+
+    monkeypatch.setattr(keys, "load", load_then_tamper)
+
+    def build(current: StoredDocument | None) -> dict[str, JsonValue]:
+        calls.append(current)
+        return {"value": 3}
+
+    assert fault_of(lambda: store.update(build)) is StoreFault.AUTHENTICATION_FAILED
+    assert calls == []
+    assert store.path.read_bytes() == tampered_bytes
