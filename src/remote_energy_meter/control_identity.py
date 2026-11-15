@@ -34,7 +34,6 @@ or replayed record fails authentication, and it sits in its own owner-only direc
 
 from __future__ import annotations
 
-import hashlib
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import InitVar, dataclass, field
@@ -49,6 +48,14 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 from remote_energy_meter.authenticated_store import AuthenticatedDocumentStore, StateAuthenticationKeyStore
+from remote_energy_meter.key_material import (
+    HASH_BYTES,
+    SCALAR_BYTES,
+    PrivateScalar,
+    scalar_bytes,
+    spki_der,
+    spki_identifier,
+)
 from remote_energy_meter.protocol_v1 import JsonValue, ProtocolViolation, decode_base64url, encode_base64url
 from remote_energy_meter.protocol_v1.encoding import decode_opaque_base64url
 from remote_energy_meter.secure_store import SecureStoreError, StoredDocument, StoreFault, ensure_private_directory
@@ -73,51 +80,9 @@ RENEW_BEFORE_EXPIRY: Final = timedelta(days=30)
 _STORE_ID: Final = "control-identity"
 _SCHEMA_VERSION: Final = 1
 _MAX_BYTES: Final = 8192
-_SCALAR_BYTES: Final = 32
-_HASH_BYTES: Final = 32
 _MAX_CERTIFICATE_BYTES: Final = 4096
 _RECORD_KEYS: Final = frozenset({"certificate_der", "private_scalar", "spki_generation", "spki_sha256"})
 _COMMON_NAME: Final = "Remote Energy Meter control"
-
-
-def _spki_der(public_key: ec.EllipticCurvePublicKey) -> bytes:
-    return public_key.public_bytes(serialization.Encoding.DER, serialization.PublicFormat.SubjectPublicKeyInfo)
-
-
-def _spki_identifier(public_key: ec.EllipticCurvePublicKey) -> str:
-    return encode_base64url(hashlib.sha256(_spki_der(public_key)).digest(), exact_length=_HASH_BYTES)
-
-
-def _scalar_bytes(private_key: ec.EllipticCurvePrivateKey) -> bytes:
-    return private_key.private_numbers().private_value.to_bytes(_SCALAR_BYTES, "big")
-
-
-class _PrivateScalar:
-    """The 32-byte private scalar. It never appears in ``repr``, ``str``, copies, or pickles."""
-
-    __slots__ = ("_value",)
-
-    def __init__(self, value: bytes) -> None:
-        if type(value) is not bytes or len(value) != _SCALAR_BYTES:
-            raise ValueError(f"a control private scalar is exactly {_SCALAR_BYTES} bytes")
-        self._value = value
-
-    def key(self) -> ec.EllipticCurvePrivateKey:
-        return ec.derive_private_key(int.from_bytes(self._value, "big"), ec.SECP256R1())
-
-    def __repr__(self) -> str:
-        return "_PrivateScalar(<redacted>)"
-
-    __str__ = __repr__
-
-    def __reduce__(self) -> str | tuple[object, ...]:
-        raise TypeError("a control private key cannot be pickled")
-
-    def __copy__(self) -> _PrivateScalar:
-        raise TypeError("a control private key cannot be copied")
-
-    def __deepcopy__(self, memo: object) -> _PrivateScalar:
-        raise TypeError("a control private key cannot be copied")
 
 
 @dataclass(frozen=True, slots=True)
@@ -132,10 +97,10 @@ class ControlIdentity:
     not_before: datetime
     not_after: datetime
     private_scalar: InitVar[bytes]
-    _scalar: _PrivateScalar = field(init=False, repr=False, compare=False)
+    _scalar: PrivateScalar = field(init=False, repr=False, compare=False)
 
     def __post_init__(self, private_scalar: bytes) -> None:
-        object.__setattr__(self, "_scalar", _PrivateScalar(private_scalar))
+        object.__setattr__(self, "_scalar", PrivateScalar(private_scalar))
 
     def __reduce__(self) -> str | tuple[object, ...]:
         raise TypeError("a control identity cannot be pickled or copied")
@@ -299,21 +264,21 @@ class ControlIdentityStore:
         certificate_der = certificate.public_bytes(serialization.Encoding.DER)
         return {
             "certificate_der": encode_base64url(certificate_der, exact_length=len(certificate_der)),
-            "private_scalar": encode_base64url(_scalar_bytes(private_key), exact_length=_SCALAR_BYTES),
+            "private_scalar": encode_base64url(scalar_bytes(private_key), exact_length=SCALAR_BYTES),
             "spki_generation": spki_generation,
-            "spki_sha256": _spki_identifier(private_key.public_key()),
+            "spki_sha256": spki_identifier(private_key.public_key()),
         }
 
     def _identity(
         self, private_key: ec.EllipticCurvePrivateKey, certificate: x509.Certificate, *, spki_generation: int
     ) -> ControlIdentity:
         return ControlIdentity(
-            spki_sha256=_spki_identifier(private_key.public_key()),
+            spki_sha256=spki_identifier(private_key.public_key()),
             spki_generation=spki_generation,
             certificate_der=certificate.public_bytes(serialization.Encoding.DER),
             not_before=certificate.not_valid_before_utc,
             not_after=certificate.not_valid_after_utc,
-            private_scalar=_scalar_bytes(private_key),
+            private_scalar=scalar_bytes(private_key),
         )
 
     def _decode(self, record: Mapping[str, JsonValue]) -> ControlIdentity:
@@ -330,8 +295,8 @@ class ControlIdentityStore:
         ):
             raise SecureStoreError(StoreFault.MALFORMED, f"{self.path} has fields of the wrong type")
         try:
-            scalar = decode_base64url(encoded_scalar, exact_length=_SCALAR_BYTES)
-            decode_base64url(encoded_spki, exact_length=_HASH_BYTES)
+            scalar = decode_base64url(encoded_scalar, exact_length=SCALAR_BYTES)
+            decode_base64url(encoded_spki, exact_length=HASH_BYTES)
             certificate = x509.load_der_x509_certificate(
                 decode_opaque_base64url(encoded_cert, minimum=1, maximum=_MAX_CERTIFICATE_BYTES)
             )
@@ -343,9 +308,9 @@ class ControlIdentityStore:
         public_key = private_key.public_key()
         certificate_key = certificate.public_key()
         if (
-            _spki_identifier(public_key) != encoded_spki
+            spki_identifier(public_key) != encoded_spki
             or not isinstance(certificate_key, ec.EllipticCurvePublicKey)
-            or _spki_der(certificate_key) != _spki_der(public_key)
+            or spki_der(certificate_key) != spki_der(public_key)
             or certificate.subject != certificate.issuer
         ):
             raise SecureStoreError(
