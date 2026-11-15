@@ -62,6 +62,13 @@ All notable changes to this project are documented here. The format follows
   and a tag all fail closed. A save verifies the record it replaces before overwriting it. The tag proves authenticity,
   not freshness: the key never rotates, so an older authentic record restored, or a record deleted, while the add-on
   is stopped is not detected by this layer; restore checks and the post-restore quarantine own that case.
+- Added the control listener's TLS identity store (`remote_energy_meter.control_identity`); nothing uses it yet. One
+  P-256 key and a self-signed `serverAuth` certificate (no host name, one-year validity, backdated five minutes) live
+  in their own owner-only, authenticated document, apart from the reporter certificates. The identity peers pin is
+  the unpadded base64url SHA-256 of the DER SubjectPublicKeyInfo. Routine renewal issues a new certificate under the
+  same key, so the pin and its generation never change; every load re-verifies that the certificate is self-signed by
+  the stored key and that the identifier is that key's hash, and fails closed otherwise. An existing identity is
+  never replaced.
 
 ### Changed
 
