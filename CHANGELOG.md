@@ -75,6 +75,16 @@ All notable changes to this project are documented here. The format follows
 - Added an exclusive create and a single-lock update to the authenticated document store. Create writes generation 1
   only if no document exists and never replaces one, and update passes the verified current record to the caller's
   function and writes the result in the same lock, so no other writer's change falls between read and write.
+- Added the generated reporter PKI store (`remote_energy_meter.reporter_pki`); nothing uses it yet. A ten-year P-256
+  CA and a one-year reporter-edge leaf under it (renewal due 30 days before expiry, never beyond the CA's own expiry)
+  are kept in two authenticated documents in two separate owner-only directories, so the CA signing key is never in
+  the leaf record the reporter edge will read. Reporters will trust the CA pin, the unpadded base64url SHA-256 of its
+  DER SubjectPublicKeyInfo. Routine leaf renewal reuses the leaf key, so its SPKI never changes and reporters need not
+  re-enroll; a renewal may change the certified host names. Every load verifies that the CA is self-signed with
+  `CA:true` and path length zero, and that the leaf is a `CA:false` `serverAuth` certificate for its stored key, signed
+  by the stored CA, whose names and CA pin match its record; otherwise it fails closed. An existing CA or leaf is
+  never replaced, and nothing is issued under an expired CA. Key handling shared with the control identity moved into
+  `remote_energy_meter.key_material`.
 
 ### Changed
 

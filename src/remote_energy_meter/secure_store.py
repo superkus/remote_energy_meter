@@ -166,6 +166,10 @@ class StoreFault(StrEnum):
     """An identity record is authentic and well formed but its parts disagree, for example a certificate whose key is
     not the stored private key, or an identifier that is not the hash of the key."""
 
+    CERTIFICATE_EXPIRED = "certificate_expired"
+    """A certificate that must sign or anchor another has expired, so nothing further can be issued under it; the
+    documented re-enrollment or transition path applies."""
+
     AUTHENTICATION_FAILED = "authentication_failed"
     """A record's integrity tag does not verify under the state-authentication key: the record was altered, moved to
     another store or generation, or written under a different key."""
