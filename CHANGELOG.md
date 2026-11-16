@@ -80,11 +80,31 @@ All notable changes to this project are documented here. The format follows
   are kept in two authenticated documents in two separate owner-only directories, so the CA signing key is never in
   the leaf record the reporter edge will read. Reporters will trust the CA pin, the unpadded base64url SHA-256 of its
   DER SubjectPublicKeyInfo. Routine leaf renewal reuses the leaf key, so its SPKI never changes and reporters need not
-  re-enroll; a renewal may change the certified host names. Every load verifies that the CA is self-signed with
-  `CA:true` and path length zero, and that the leaf is a `CA:false` `serverAuth` certificate for its stored key, signed
-  by the stored CA, whose names and CA pin match its record; otherwise it fails closed. An existing CA or leaf is
-  never replaced, and nothing is issued under an expired CA. Key handling shared with the control identity moved into
-  `remote_energy_meter.key_material`.
+  re-enroll; a renewal may change the certified host names. Every load verifies that the CA is self-signed with a
+  critical `CA:true`, path length zero and `keyCertSign`, and that the leaf is a critical `CA:false` certificate with a
+  critical `digitalSignature` key usage, an extended key usage of exactly `serverAuth`, DNS-only names that match its
+  record, a validity inside the CA's, and a signature by the stored CA whose pin and generation match its record;
+  otherwise it fails closed. The CA and leaf directories are resolved and may not be equal or nested. An existing CA
+  or leaf is never replaced, and nothing is issued under an expired CA. Key handling shared with the control identity
+  moved into `remote_energy_meter.key_material`.
+- Added the control authority store (`remote_energy_meter.control_authority`); nothing uses it yet. One authenticated
+  document holds, together, the authorized integration control key with its key generation and the control-SPKI pin
+  and generation it was authorized against, the revocation marks and recovery high-water mark, the consumed
+  pairing-credential digests with their absolute expiry, and the exact results of the two consuming transactions.
+  Pairing authorizes the key, consumes the credential and records the confirm result in one atomic update; recovery
+  consumes a fresh credential, revokes the named generations, clears the authority and records the revoke result in one
+  atomic update. Generations only rise and are never reused, a revoked generation is dead for good, a credential is
+  usable only strictly before its embedded expiry whether or not its consumed digest survives, and a recorded result
+  is returnable only strictly before its expiry, then kept as a non-returning tombstone for five more minutes. All
+  expiries are absolute instants stored in the records, so restoring an older backup cannot restart or extend one.
+  The store reads its clock inside the locked update, next to the state read. An expired credential is refused as
+  `credential_expired` first; otherwise `credential_expires_at` must be at most 600 seconds after now and
+  `result_expires_at` after now and no later than `credential_expires_at`, or the call raises `ValueError` before
+  anything is written. Retention is bounded: at most 64 consumed credentials and 32 recorded results, each response at
+  most 2 KiB. A transaction that would exceed a cap is refused as `capacity_exceeded`; expired entries are compacted
+  before the check. A recovery counter at its maximum is refused as `generation_exhausted`. The store records only
+  how far SPKI generations are revoked and does not enforce that SPKI generations rise; the TLS identity store owns
+  issuing them.
 
 ### Changed
 
@@ -102,8 +122,8 @@ All notable changes to this project are documented here. The format follows
 
 ### Security
 
-- Added exact runtime pins for `cryptography` 50.0.0 and `idna` 3.20 and included them in the hash-locked, audited add-on
-  dependency set.
+- Added exact runtime pins for `cryptography` 50.0.0 and `idna` 3.20 and included them in the hash-locked, audited
+  add-on dependency set.
 
 ## [0.1.3]
 
