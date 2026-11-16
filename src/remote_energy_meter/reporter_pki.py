@@ -16,8 +16,6 @@ renewal (task 12.1), perform a CA transition (requirement 5.4), read operator fi
 Creation is two steps: the CA, then its first leaf. A crash between them leaves a CA and no leaf, which
 :meth:`ReporterPkiStore.load_leaf` reports as ``IDENTITY_MISSING``; :meth:`ReporterPkiStore.create_leaf` finishes it.
 
-The design is "native-computer-reporters design.md".
-
 Leaf host names are DNS names in canonical lowercase LDH form (no IP addresses). The reporter's server-identity host is
 supplied by the caller; this module only records and certifies it.
 """
