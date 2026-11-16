@@ -1233,9 +1233,7 @@ def test_a_clock_that_steps_back_cannot_revive_a_compacted_credential(
     assert reason is AuthorityRefusal.CREDENTIAL_EXPIRED
 
 
-def test_a_clock_that_steps_back_cannot_reopen_an_expired_result_window(
-    store: ControlAuthorityStore, clock: Clock
-) -> None:
+def test_an_expired_result_body_stays_gone_after_a_clock_step_back(store: ControlAuthorityStore, clock: Clock) -> None:
     pair(store)  # the confirm result is returnable until NOW+600
     clock.at(NOW + 700)
     recover(store, credential_expires_at=NOW + 1000, result_expires_at=NOW + 1000)

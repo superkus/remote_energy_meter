@@ -42,12 +42,18 @@ error.
 
 The clock guard: the record also stores ``latest_seen``, the highest server time any transaction has acted on. Every
 transaction and every lookup acts on ``max(clock, latest_seen)``, and each write stores the time it acted on, so time
-never goes backwards for this store. A wall clock that steps back (an NTP correction, a resumed virtual machine) can
-therefore neither make a compacted, already-consumed credential look unexpired again nor reopen an expired result
-window. The guard cannot ratchet far ahead by accident: a write needs a credential whose expiry lies within ten minutes
-after the write, so the add-on's clock at a write is within ten minutes of the Home Assistant clock that issued it.
-After a restore from an older backup the guard is only as recent as that backup; the post-restore quarantine owns that
-case. A guard that is ahead of the real clock only makes the store act on the later time until real time catches up.
+never goes backwards for this store. A wall clock that steps back (an NTP correction, a resumed virtual machine)
+therefore cannot make a compacted, already-consumed credential look unexpired again. (An expired result body stays
+gone after such a step because every write blanks it, and the lookup clamp repeats that rule as defence in depth.)
+
+The guard has a cost. A write needs a credential expiring within ten minutes after the write, so the add-on clock at a
+write cannot be more than about ten minutes away from the clock that issued the credential. That bounds the
+disagreement between the two clocks, not the error against real time: both normally share one host clock, so a write
+made while that clock is wrong-forward stores the error. Until real time reaches ``latest_seen`` the store refuses
+every credential expiring before it, pairing and recovery alike (``credential_expired``), and nothing in the store
+clears it; deleting the document would also discard the revocation marks. Task 7.4 must surface this refusal
+distinctly, and the post-restore quarantine owns any operator remedy. After a restore from an older backup the guard
+is only as recent as that backup, which the quarantine also owns.
 
 Capacities: at most 64 retained consumed-credential digests (``MAX_CONSUMED``) and 32 retained results
 (``MAX_RESULTS``, bodies and tombstones), and a recorded response of at most 2 KiB (``MAX_RESPONSE_BYTES``). A

@@ -107,8 +107,8 @@ All notable changes to this project are documented here. The format follows
   issuing them.
   A clock guard keeps time from going backwards for this store: the record stores the highest server time any
   transaction acted on, and every transaction and lookup acts on the later of that and the clock, so a wall clock
-  that steps back cannot make a compacted, already-consumed credential look unexpired again or reopen an expired
-  result window.
+  that steps back cannot make a compacted, already-consumed credential look unexpired again. The cost is that a write
+  made while the clock is wrong-forward holds pairing and recovery until real time catches up.
 
 ### Changed
 
