@@ -347,7 +347,8 @@ documentation pass.
     memory-only pending retries, and fixed expiry. In the authorizing transaction, atomically persist authority,
     credential consumption, and a separately keyed integrity-protected exact confirm result; look it up by bootstrap ID
     and request hash before consumed-secret rejection through the original expiry, then retain only the replay marker
-    through expiry plus five minutes. Cover dropped response in every phase, exact/changed and duplicate/out-of-order
+    through expiry plus five minutes. Pass the HMAC-verified credential's embedded expiry as both `credential_expires_at`
+    and `result_expires_at`, and map an out-of-range expiry to a refusal, never a 500. Cover dropped response in every phase, exact/changed and duplicate/out-of-order
     phases, expiry immediately before/at the boundary, pending restart, exact and changed confirm retry after restart,
     and crashes immediately before and after final commit.
 

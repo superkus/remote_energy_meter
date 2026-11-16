@@ -33,6 +33,15 @@ Rules checked on each consuming transaction, in this order for the credential: a
 ``credential_expires_at <= now + 600`` seconds and ``now < result_expires_at <= credential_expires_at``, otherwise
 ``ValueError`` is raised and nothing is written. A consumed digest is then refused as ``credential_consumed``.
 
+Task 7.4 contract: the caller passes the HMAC-verified credential's embedded expiry as ``credential_expires_at`` and
+also as ``result_expires_at``. The spec's retry window and tombstone (``expires_at + 300`` seconds) are defined on that
+instant. The store accepts any ``result_expires_at`` in ``(now, credential_expires_at]``, but only the credential
+expiry satisfies the spec. 7.4 must treat the ``ValueError`` above as an internal or clock-skew error, or range-check
+the embedded expiry first and map it to a refusal, so a hostile credential never becomes a 500.
+
+The store assumes a non-regressing wall clock: a backward step of more than ``TOMBSTONE_GRACE_SECONDS`` can make a
+compacted consumed credential look unexpired again. Any monotonic-clock guard is the caller's, or a pending decision.
+
 Capacities: at most 64 retained consumed-credential digests (``MAX_CONSUMED``) and 32 retained results
 (``MAX_RESULTS``, bodies and tombstones), and a recorded response of at most 2 KiB (``MAX_RESPONSE_BYTES``). A
 transaction that would exceed a retention cap is refused as ``capacity_exceeded``; entries past their tombstone period
@@ -40,8 +49,7 @@ are compacted before the check, so only live retention counts. A key or recovery
 is refused as ``generation_exhausted``.
 
 SPKI generations: this store only records ``spki_revoked_through`` and refuses an authorization whose SPKI generation is
-at or below it. It does not enforce that SPKI generations rise; the TLS identity/PKI store owns issuing them. A durable
-SPKI high-water mark here is a pending user decision.
+at or below it. It does not enforce that SPKI generations rise; the TLS identity/PKI store owns issuing them.
 
 This module is state and invariants only. It does not verify HMAC proofs, parse transcripts, generate credentials,
 serve routes, or invalidate leases and request nonces (those belong to task 7.4 and to the replay and result stores).
@@ -92,7 +100,11 @@ DOCUMENT_NAME: Final = "control-authority.json"
 TOMBSTONE_GRACE_SECONDS: Final = 300
 """A consumed-credential digest and a result tombstone are kept this long after the credential's embedded expiry."""
 CREDENTIAL_MAX_LIFETIME_SECONDS: Final = 600
-"""A pairing credential expires at most ten minutes after its creation, which is at or before the receipt time."""
+"""A pairing credential expires at most ten minutes after its creation.
+
+Checked as ``expires_at <= now + this``. Creation is at or before receipt time, so this admits every credential that
+lived at most ten minutes.
+"""
 MAX_CONSUMED: Final = 64
 """Cap on retained consumed-credential digests; a further consuming transaction is refused until some are compacted."""
 MAX_RESULTS: Final = 32
@@ -346,10 +358,18 @@ class ControlAuthorityStore:
             bootstrap_id: The completed bootstrap's identifier (canonical 22-character base64url).
             request_hash: SHA-256 of the exact confirm request.
             response: The exact success response bytes to return on a retry.
-            result_expires_at: The last instant, exclusive, at which the response may be returned.
+            result_expires_at: The last instant, exclusive, at which the response may be returned. Task 7.4 must pass
+                the HMAC-verified credential's embedded expiry, the same value as ``credential_expires_at``: the
+                spec's retry window and tombstone (``expires_at + 300`` seconds) are defined on that instant. The
+                store accepts anything in ``(now, credential_expires_at]``, but only the credential expiry
+                satisfies the spec.
 
         Raises:
-            ValueError: An argument is malformed.
+            ValueError: An argument is malformed. Also raised when the credential is not expired but
+                ``credential_expires_at > now + CREDENTIAL_MAX_LIFETIME_SECONDS`` or ``result_expires_at`` is not in
+                ``(now, credential_expires_at]``; an expired credential is refused as ``CREDENTIAL_EXPIRED`` first.
+                Nothing is written. Task 7.4 must treat that ``ValueError`` as an internal or clock-skew error, or
+                range-check the embedded expiry first and map it to a refusal, never a 500 for a hostile credential.
             AuthorityRefused: ``ALREADY_PAIRED``, ``CREDENTIAL_CONSUMED``, ``CREDENTIAL_EXPIRED``,
                 ``KEY_GENERATION_MISMATCH``, ``SPKI_REVOKED``, ``RESULT_ID_REUSED``, ``CAPACITY_EXCEEDED`` or
                 ``GENERATION_EXHAUSTED``.
@@ -425,8 +445,20 @@ class ControlAuthorityStore:
         The authority is cleared whatever the scope: a revoked key or SPKI is never reactivated, and re-pairing needs a
         second fresh credential. ``scope`` decides which generations become permanently unusable.
 
+        Args:
+            credential_expires_at: The credential's embedded absolute expiry (Unix seconds).
+            result_expires_at: The last instant, exclusive, at which the response may be returned. Task 7.4 must pass
+                the HMAC-verified credential's embedded expiry, the same value as ``credential_expires_at``: the
+                spec's retry window and tombstone (``expires_at + 300`` seconds) are defined on that instant. The
+                store accepts anything in ``(now, credential_expires_at]``, but only the credential expiry
+                satisfies the spec.
+
         Raises:
-            ValueError: An argument is malformed.
+            ValueError: An argument is malformed. Also raised when the credential is not expired but
+                ``credential_expires_at > now + CREDENTIAL_MAX_LIFETIME_SECONDS`` or ``result_expires_at`` is not in
+                ``(now, credential_expires_at]``; an expired credential is refused as ``CREDENTIAL_EXPIRED`` first.
+                Nothing is written. Task 7.4 must treat that ``ValueError`` as an internal or clock-skew error, or
+                range-check the embedded expiry first and map it to a refusal, never a 500 for a hostile credential.
             AuthorityRefused: ``NOT_PAIRED``, ``CURRENT_STATE_MISMATCH`` (the supplied current thumbprint, generation or
                 SPKI is not the stored one), ``GENERATION_EXHAUSTED`` (the recovery counter is at its maximum),
                 ``RECOVERY_GENERATION_MISMATCH``, ``CREDENTIAL_CONSUMED``, ``CREDENTIAL_EXPIRED``,

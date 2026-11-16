@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric import ec
 from remote_energy_meter import control_authority
 from remote_energy_meter.authenticated_store import AuthenticatedDocumentStore, StateAuthenticationKeyStore
 from remote_energy_meter.control_authority import (
+    CREDENTIAL_MAX_LIFETIME_SECONDS,
     DOCUMENT_NAME,
     MAX_CONSUMED,
     MAX_RESPONSE_BYTES,
@@ -33,6 +34,7 @@ from remote_energy_meter.control_authority import (
     ResultKind,
     RevocationScope,
 )
+from remote_energy_meter.key_material import HASH_BYTES
 from remote_energy_meter.protocol_v1 import encode_base64url
 from remote_energy_meter.secure_store import SecureStoreError, StoreFault
 
@@ -825,18 +827,25 @@ def test_malformed_pairing_arguments_raise_value_error_and_write_nothing(
 # lifetimes: credential at most ten minutes, result no later than its credential
 # --------------------------------------------------------------------------------------------------
 
-MAX_CREDENTIAL_LIFETIME = 600
+LIFETIME_MESSAGE = "more than the maximum"
+WINDOW_MESSAGE = "after now"
 UINT64_MAX = 2**64 - 1
 
 
-def rejected_and_unchanged(store: ControlAuthorityStore, operation: Callable[[], object]) -> None:
-    """The operation raises ``ValueError`` and the document is exactly as it was (or still absent)."""
+def directory_listing(store: ControlAuthorityStore) -> list[str]:
+    return sorted(p.name for p in store.path.parent.iterdir()) if store.path.parent.exists() else []
+
+
+def rejected_and_unchanged(store: ControlAuthorityStore, operation: Callable[[], object], message: str) -> None:
+    """The operation raises ``ValueError`` matching ``message``; the document and its directory are as they were."""
     existed = store.path.exists()
     before = store.path.read_bytes() if existed else None
-    with pytest.raises(ValueError, match="expires_at"):
+    files_before = directory_listing(store)
+    with pytest.raises(ValueError, match=message):
         operation()
     assert store.path.exists() == existed
     assert (store.path.read_bytes() if existed else None) == before
+    assert directory_listing(store) == files_before
 
 
 def pairing(store: ControlAuthorityStore) -> Callable[..., ControlAuthority]:
@@ -864,7 +873,9 @@ def test_a_result_must_expire_after_now_and_no_later_than_its_credential(
 ) -> None:
     run = operation(store)
 
-    rejected_and_unchanged(store, lambda: run(credential_expires_at=NOW + 600, result_expires_at=result_expires_at))
+    rejected_and_unchanged(
+        store, lambda: run(credential_expires_at=NOW + 600, result_expires_at=result_expires_at), WINDOW_MESSAGE
+    )
 
 
 @pytest.mark.parametrize("operation", OPERATIONS)
@@ -893,7 +904,11 @@ def test_a_credential_may_not_expire_more_than_ten_minutes_after_now(
     run = operation(store)
 
     rejected_and_unchanged(
-        store, lambda: run(credential_expires_at=credential_expires_at, result_expires_at=NOW + MAX_CREDENTIAL_LIFETIME)
+        store,
+        lambda: run(
+            credential_expires_at=credential_expires_at, result_expires_at=NOW + CREDENTIAL_MAX_LIFETIME_SECONDS
+        ),
+        LIFETIME_MESSAGE,
     )
 
 
@@ -911,8 +926,102 @@ def test_a_credential_expiring_exactly_ten_minutes_after_now_is_accepted(
 def test_the_lifetime_bound_follows_the_injected_clock(store: ControlAuthorityStore, clock: Clock) -> None:
     clock.at(NOW + 1000)
 
-    rejected_and_unchanged(store, lambda: pair(store, credential_expires_at=NOW + 1601, result_expires_at=NOW + 1600))
+    rejected_and_unchanged(
+        store, lambda: pair(store, credential_expires_at=NOW + 1601, result_expires_at=NOW + 1600), LIFETIME_MESSAGE
+    )
     assert pair(store, credential_expires_at=NOW + 1600, result_expires_at=NOW + 1600).authority is not None
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+def test_the_minimal_window_of_one_second_is_accepted(
+    store: ControlAuthorityStore, operation: Callable[[ControlAuthorityStore], Callable[..., ControlAuthority]]
+) -> None:
+    run = operation(store)
+
+    state = run(credential_expires_at=NOW + 1, result_expires_at=NOW + 1)
+
+    assert any(c.expires_at == NOW + 1 for c in state.consumed)
+    assert any(r.expires_at == NOW + 1 for r in state.results)
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+def test_a_credential_expiring_exactly_now_is_expired_not_malformed(
+    store: ControlAuthorityStore, operation: Callable[[ControlAuthorityStore], Callable[..., ControlAuthority]]
+) -> None:
+    run = operation(store)
+
+    reason = unchanged_or_absent(store, lambda: run(credential_expires_at=NOW, result_expires_at=NOW + 1))
+
+    assert reason is AuthorityRefusal.CREDENTIAL_EXPIRED
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+@pytest.mark.parametrize("result_expires_at", [NOW - 5, NOW + 500], ids=["before-now", "after-credential-expiry"])
+def test_an_expired_credential_is_refused_as_expired_before_its_result_window_is_judged(
+    store: ControlAuthorityStore,
+    operation: Callable[[ControlAuthorityStore], Callable[..., ControlAuthority]],
+    result_expires_at: int,
+) -> None:
+    run = operation(store)
+
+    reason = unchanged_or_absent(store, lambda: run(credential_expires_at=NOW - 1, result_expires_at=result_expires_at))
+
+    assert reason is AuthorityRefusal.CREDENTIAL_EXPIRED
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+def test_an_over_long_expiry_is_a_value_error_even_for_a_consumed_credential(
+    store: ControlAuthorityStore, operation: Callable[[ControlAuthorityStore], Callable[..., ControlAuthority]]
+) -> None:
+    if operation is pairing:
+        pair(store)  # consumes digest(1), then recovery leaves the store unpaired so a pairing reaches the rules
+        recover(store)
+    run = operation(store)  # the recovery operation pairs with digest(1) itself
+    assert store.load().is_consumed(digest(1))
+
+    rejected_and_unchanged(
+        store,
+        lambda: run(
+            credential_digest=digest(1),
+            credential_expires_at=NOW + CREDENTIAL_MAX_LIFETIME_SECONDS + 1,
+            result_expires_at=NOW + CREDENTIAL_MAX_LIFETIME_SECONDS,
+        ),
+        LIFETIME_MESSAGE,
+    )
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+def test_after_a_rejected_lifetime_the_next_valid_operation_succeeds_and_state_is_unchanged(
+    store: ControlAuthorityStore, operation: Callable[[ControlAuthorityStore], Callable[..., ControlAuthority]]
+) -> None:
+    run = operation(store)
+    before = store.load()
+
+    rejected_and_unchanged(
+        store, lambda: run(credential_expires_at=NOW + CREDENTIAL_MAX_LIFETIME_SECONDS + 1), LIFETIME_MESSAGE
+    )
+    assert store.load() == before
+    state = run()
+
+    assert state.consumed != before.consumed
+
+
+def test_a_document_at_every_capacity_with_maximal_bodies_fits_the_size_limit_and_round_trips(
+    store: ControlAuthorityStore, keys: StateAuthenticationKeyStore
+) -> None:
+    body = b"x" * MAX_RESPONSE_BYTES
+    results = [
+        {**r, "response": encode_base64url(body, exact_length=MAX_RESPONSE_BYTES)}
+        for r in full_results(NOW + 1000)[: MAX_RESULTS - 1]
+    ]
+    fresh = at_limit(store, keys, consumed=full_consumed(NOW + 1000)[: MAX_CONSUMED - 1], results=results)
+
+    state = pair(fresh, credential_digest=digest(200), bootstrap_id=ident(200), request_hash=digest(201), response=body)
+
+    assert len(state.consumed) == MAX_CONSUMED and len(state.results) == MAX_RESULTS
+    assert all(r.response == body for r in state.results)
+    assert fresh.path.stat().st_size < control_authority._MAX_BYTES
+    assert fresh.load() == state
 
 
 # --------------------------------------------------------------------------------------------------
@@ -922,7 +1031,8 @@ def test_the_lifetime_bound_follows_the_injected_clock(store: ControlAuthoritySt
 
 def full_consumed(expires_at: int) -> list[dict[str, Any]]:
     return [
-        {"digest": encode_base64url(digest(i), exact_length=32), "expires_at": expires_at} for i in range(MAX_CONSUMED)
+        {"digest": encode_base64url(digest(i), exact_length=HASH_BYTES), "expires_at": expires_at}
+        for i in range(MAX_CONSUMED)
     ]
 
 
@@ -932,7 +1042,7 @@ def full_results(expires_at: int) -> list[dict[str, Any]]:
             "expires_at": expires_at,
             "id": ident(index),
             "kind": "bootstrap-confirm",
-            "request_hash": encode_base64url(digest(index), exact_length=32),
+            "request_hash": encode_base64url(digest(index), exact_length=HASH_BYTES),
             "response": encode_base64url(b"r", exact_length=1),
         }
         for index in range(MAX_RESULTS)
@@ -1010,9 +1120,9 @@ def test_the_clock_is_read_inside_the_document_update_while_the_lock_is_held(
     holder: list[ControlAuthorityStore] = []
 
     def clock() -> datetime:
-        events.append("clock-locked" if holder and holder[0]._lock.locked() else "clock-unlocked")
-        if holder and "update" in events:
-            events.append("clock-in-update")
+        # The private lock is read because it is the only observable for "the store lock is held".
+        locked = bool(holder) and holder[0]._lock.locked()
+        events.append(("clock-in-update" if "update" in events else "clock-locked") if locked else "clock-free")
         return T0
 
     store = ControlAuthorityStore(tmp_path / "authority", keys=keys, clock=clock)
@@ -1032,9 +1142,8 @@ def test_the_clock_is_read_inside_the_document_update_while_the_lock_is_held(
 
     run()
 
-    assert "clock-unlocked" not in events
+    assert "clock-free" not in events
     assert "clock-in-update" in events
-    assert events.index("update") < events.index("clock-in-update")
 
 
 def test_a_naive_clock_is_rejected(tmp_path: Path, keys: StateAuthenticationKeyStore) -> None:
