@@ -754,6 +754,8 @@ def test_an_authentic_record_that_breaks_an_invariant_is_inconsistent(
 @pytest.mark.parametrize(
     "changes",
     [
+        {"latest_seen": "1"},
+        {"latest_seen": None},
         {"key_high_water": "1"},
         {"key_high_water": True},
         {"recovery_high_water": None},
@@ -1161,3 +1163,151 @@ def test_the_capacity_constants_are_bounded() -> None:
 def test_the_module_exports_its_public_names() -> None:
     for name in control_authority.__all__:
         assert hasattr(control_authority, name)
+
+
+# --------------------------------------------------------------------------------------------------
+# the clock guard
+# --------------------------------------------------------------------------------------------------
+
+
+def test_every_write_stores_the_time_it_acted_on(store: ControlAuthorityStore, clock: Clock) -> None:
+    assert store.load().latest_seen == 0
+
+    state = pair(store)
+    assert state.latest_seen == NOW
+    assert state.authority is not None and state.authority.authorized_at == NOW
+
+    clock.at(NOW + 300)
+    assert recover(store).latest_seen == NOW + 300
+
+
+def test_time_never_goes_backwards_for_the_store(store: ControlAuthorityStore, clock: Clock) -> None:
+    pair(store)
+    clock.at(NOW + 300)
+    recover(store)
+    clock.at(NOW + 50)  # the wall clock stepped back by five minutes
+
+    state = pair(
+        store,
+        credential_digest=digest(3),
+        bootstrap_id=ident(3),
+        request_hash=digest(103),
+        credential_expires_at=NOW + 600,
+        result_expires_at=NOW + 600,
+    )
+
+    assert state.latest_seen == NOW + 300  # not lowered
+    assert state.authority is not None and state.authority.authorized_at == NOW + 300  # acted on the later time
+
+
+def test_a_clock_that_steps_back_cannot_revive_a_compacted_credential(
+    store: ControlAuthorityStore, clock: Clock
+) -> None:
+    pair(store)  # consumes digest 1, which expires at NOW+600
+    clock.at(NOW + 300)
+    recover(store, credential_expires_at=NOW + 900, result_expires_at=NOW + 900)
+    clock.at(NOW + 600 + TOMBSTONE_GRACE_SECONDS)  # digest 1's grace ends: the next write compacts it
+    pair(
+        store,
+        credential_digest=digest(3),
+        bootstrap_id=ident(3),
+        request_hash=digest(103),
+        credential_expires_at=NOW + 1500,
+        result_expires_at=NOW + 1500,
+    )
+    recover(
+        store,
+        credential_digest=digest(4),
+        recovery_id=ident(4),
+        request_hash=digest(104),
+        credential_expires_at=NOW + 1500,
+        result_expires_at=NOW + 1500,
+    )
+    assert not store.load().is_consumed(digest(1))  # compacted away
+    clock.at(NOW + 100)  # the wall clock steps back far beyond the five-minute grace
+
+    reason = unchanged(
+        store, lambda: pair(store, credential_digest=digest(1), bootstrap_id=ident(8), request_hash=digest(108))
+    )
+
+    assert reason is AuthorityRefusal.CREDENTIAL_EXPIRED
+
+
+def test_a_clock_that_steps_back_cannot_reopen_an_expired_result_window(
+    store: ControlAuthorityStore, clock: Clock
+) -> None:
+    pair(store)  # the confirm result is returnable until NOW+600
+    clock.at(NOW + 700)
+    recover(store, credential_expires_at=NOW + 1000, result_expires_at=NOW + 1000)
+    clock.at(NOW + 10)
+
+    lookup = store.lookup_result(ResultKind.BOOTSTRAP_CONFIRM, ident(1), digest(101))
+
+    assert (lookup.response, lookup.conflict) == (None, False)
+
+
+def test_a_lookup_also_refuses_a_body_whose_window_the_stored_time_has_passed(
+    store: ControlAuthorityStore, keys: StateAuthenticationKeyStore, clock: Clock
+) -> None:
+    """Defence in depth: every write already blanks an expired body, so only an inconsistent record shows this."""
+    pair(store)
+    ahead = forge(store, keys, latest_seen=NOW + 700)
+    clock.at(NOW + 10)
+
+    lookup = ahead.lookup_result(ResultKind.BOOTSTRAP_CONFIRM, ident(1), digest(101))
+
+    assert (lookup.response, lookup.conflict) == (None, False)
+
+
+def test_while_the_store_is_ahead_of_the_clock_it_acts_on_the_later_time(
+    store: ControlAuthorityStore, clock: Clock
+) -> None:
+    pair(store)
+    clock.at(NOW + 300)
+    recover(store)
+    clock.at(NOW + 100)  # behind the stored time
+
+    # A credential that expires before the stored time is refused, failing closed until real time catches up.
+    refused = unchanged(
+        store,
+        lambda: pair(
+            store,
+            credential_digest=digest(3),
+            bootstrap_id=ident(3),
+            request_hash=digest(103),
+            credential_expires_at=NOW + 250,
+            result_expires_at=NOW + 250,
+        ),
+    )
+    accepted = pair(
+        store,
+        credential_digest=digest(4),
+        bootstrap_id=ident(4),
+        request_hash=digest(104),
+        credential_expires_at=NOW + 900,
+        result_expires_at=NOW + 900,
+    )
+
+    assert refused is AuthorityRefusal.CREDENTIAL_EXPIRED
+    assert accepted.authority is not None and accepted.latest_seen == NOW + 300
+
+
+def test_a_record_authorizing_a_key_after_its_latest_time_is_inconsistent(
+    store: ControlAuthorityStore, keys: StateAuthenticationKeyStore
+) -> None:
+    pair(store)
+
+    assert fault_of(forge(store, keys, latest_seen=NOW - 1).load) is StoreFault.IDENTITY_INCONSISTENT
+
+
+def test_a_record_without_the_guard_field_is_malformed(
+    store: ControlAuthorityStore, keys: StateAuthenticationKeyStore
+) -> None:
+    pair(store)
+    document = second_writer(store, keys)
+    loaded = document.load()
+    assert loaded is not None
+    document.save({key: value for key, value in loaded.record.items() if key != "latest_seen"})
+
+    fresh = ControlAuthorityStore(store.path.parent, keys=keys, clock=store._clock)
+    assert fault_of(fresh.load) is StoreFault.MALFORMED
