@@ -119,11 +119,11 @@ def recover(store: ControlAuthorityStore, **overrides: Any) -> ControlAuthority:
         "spki_generation": current.spki_generation,
         "recovery_generation": store.load().next_recovery_generation,
         "credential_digest": digest(2),
-        "credential_expires_at": NOW + 900,
+        "credential_expires_at": NOW + 600,
         "recovery_id": ident(2),
         "request_hash": digest(102),
         "response": b'{"revoked":true}',
-        "result_expires_at": NOW + 900,
+        "result_expires_at": NOW + 600,
     }
     arguments.update(overrides)
     return store.revoke_for_recovery(**arguments)
@@ -409,15 +409,44 @@ def test_recovery_without_authority_is_refused(store: ControlAuthorityStore) -> 
             spki_generation=1,
             recovery_generation=2,
             credential_digest=digest(4),
-            credential_expires_at=NOW + 900,
+            credential_expires_at=NOW + 600,
             recovery_id=ident(4),
             request_hash=digest(104),
             response=b"x",
-            result_expires_at=NOW + 900,
+            result_expires_at=NOW + 600,
         ),
     )
 
     assert reason is AuthorityRefusal.NOT_PAIRED
+
+
+def test_recovery_is_refused_as_exhausted_when_the_recovery_counter_is_at_its_maximum(
+    store: ControlAuthorityStore, keys: StateAuthenticationKeyStore
+) -> None:
+    pair(store)
+    exhausted = forge(store, keys, recovery_high_water=UINT64_MAX)
+    current = exhausted.load().authority
+    assert current is not None
+
+    reason = unchanged(
+        exhausted,
+        lambda: exhausted.revoke_for_recovery(
+            scope=RevocationScope.CONTROL_KEY,
+            key_thumbprint=current.thumbprint,
+            key_generation=current.key_generation,
+            spki_sha256=current.spki_sha256,
+            spki_generation=current.spki_generation,
+            recovery_generation=UINT64_MAX,
+            credential_digest=digest(2),
+            credential_expires_at=NOW + 600,
+            recovery_id=ident(2),
+            request_hash=digest(102),
+            response=b"x",
+            result_expires_at=NOW + 600,
+        ),
+    )
+
+    assert reason is AuthorityRefusal.GENERATION_EXHAUSTED
 
 
 @pytest.mark.parametrize(
@@ -493,7 +522,8 @@ def test_compaction_drops_a_result_body_at_its_expiry_and_the_tombstone_at_the_e
 
 def test_a_write_compacts_what_the_clock_has_made_unnecessary(store: ControlAuthorityStore, clock: Clock) -> None:
     pair(store)
-    recover(store)
+    clock.at(NOW + 300)  # a credential lives at most ten minutes, so a later expiry needs a later creation
+    recover(store, credential_expires_at=NOW + 900, result_expires_at=NOW + 900)
     clock.at(NOW + 600 + TOMBSTONE_GRACE_SECONDS)
 
     state = pair(
@@ -501,8 +531,8 @@ def test_a_write_compacts_what_the_clock_has_made_unnecessary(store: ControlAuth
         credential_digest=digest(3),
         bootstrap_id=ident(3),
         request_hash=digest(103),
-        credential_expires_at=NOW + 5000,
-        result_expires_at=NOW + 5000,
+        credential_expires_at=NOW + 1500,
+        result_expires_at=NOW + 1500,
     )
 
     assert not state.is_consumed(digest(1))  # expired at NOW+600, grace over
@@ -521,8 +551,8 @@ def test_a_compacted_digest_does_not_make_an_expired_credential_usable_again(
         credential_digest=digest(3),
         bootstrap_id=ident(3),
         request_hash=digest(103),
-        credential_expires_at=NOW + 5000,
-        result_expires_at=NOW + 5000,
+        credential_expires_at=NOW + 1500,
+        result_expires_at=NOW + 1500,
     )
     assert not store.load().is_consumed(digest(1))
     recover(
@@ -530,8 +560,8 @@ def test_a_compacted_digest_does_not_make_an_expired_credential_usable_again(
         credential_digest=digest(4),
         recovery_id=ident(4),
         request_hash=digest(104),
-        credential_expires_at=NOW + 5000,
-        result_expires_at=NOW + 5000,
+        credential_expires_at=NOW + 1500,
+        result_expires_at=NOW + 1500,
     )
 
     reason = unchanged(
@@ -789,6 +819,222 @@ def test_malformed_pairing_arguments_raise_value_error_and_write_nothing(
     with pytest.raises(ValueError, match=message):
         pair(store, **override)
     assert not store.path.exists()
+
+
+# --------------------------------------------------------------------------------------------------
+# lifetimes: credential at most ten minutes, result no later than its credential
+# --------------------------------------------------------------------------------------------------
+
+MAX_CREDENTIAL_LIFETIME = 600
+UINT64_MAX = 2**64 - 1
+
+
+def rejected_and_unchanged(store: ControlAuthorityStore, operation: Callable[[], object]) -> None:
+    """The operation raises ``ValueError`` and the document is exactly as it was (or still absent)."""
+    existed = store.path.exists()
+    before = store.path.read_bytes() if existed else None
+    with pytest.raises(ValueError, match="expires_at"):
+        operation()
+    assert store.path.exists() == existed
+    assert (store.path.read_bytes() if existed else None) == before
+
+
+def pairing(store: ControlAuthorityStore) -> Callable[..., ControlAuthority]:
+    return lambda **overrides: pair(store, **overrides)
+
+
+def recovery(store: ControlAuthorityStore) -> Callable[..., ControlAuthority]:
+    pair(store)
+    return lambda **overrides: recover(store, **overrides)
+
+
+OPERATIONS = [pytest.param(pairing, id="pairing"), pytest.param(recovery, id="recovery")]
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+@pytest.mark.parametrize(
+    "result_expires_at",
+    [NOW - 1, NOW, NOW + 601],
+    ids=["before-now", "equal-to-now", "after-credential-expiry"],
+)
+def test_a_result_must_expire_after_now_and_no_later_than_its_credential(
+    store: ControlAuthorityStore,
+    operation: Callable[[ControlAuthorityStore], Callable[..., ControlAuthority]],
+    result_expires_at: int,
+) -> None:
+    run = operation(store)
+
+    rejected_and_unchanged(store, lambda: run(credential_expires_at=NOW + 600, result_expires_at=result_expires_at))
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+@pytest.mark.parametrize(
+    "result_expires_at", [NOW + 1, NOW + 300, NOW + 600], ids=["now+1", "inside", "equal-to-credential"]
+)
+def test_a_result_expiring_after_now_up_to_its_credential_expiry_is_accepted(
+    store: ControlAuthorityStore,
+    operation: Callable[[ControlAuthorityStore], Callable[..., ControlAuthority]],
+    result_expires_at: int,
+) -> None:
+    run = operation(store)
+
+    state = run(credential_expires_at=NOW + 600, result_expires_at=result_expires_at)
+
+    assert result_expires_at in {r.expires_at for r in state.results}
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+@pytest.mark.parametrize("credential_expires_at", [NOW + 601, NOW + 3600, UINT64_MAX])
+def test_a_credential_may_not_expire_more_than_ten_minutes_after_now(
+    store: ControlAuthorityStore,
+    operation: Callable[[ControlAuthorityStore], Callable[..., ControlAuthority]],
+    credential_expires_at: int,
+) -> None:
+    run = operation(store)
+
+    rejected_and_unchanged(
+        store, lambda: run(credential_expires_at=credential_expires_at, result_expires_at=NOW + MAX_CREDENTIAL_LIFETIME)
+    )
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+def test_a_credential_expiring_exactly_ten_minutes_after_now_is_accepted(
+    store: ControlAuthorityStore, operation: Callable[[ControlAuthorityStore], Callable[..., ControlAuthority]]
+) -> None:
+    run = operation(store)
+
+    state = run(credential_expires_at=NOW + 600, result_expires_at=NOW + 600)
+
+    assert any(c.expires_at == NOW + 600 for c in state.consumed)
+
+
+def test_the_lifetime_bound_follows_the_injected_clock(store: ControlAuthorityStore, clock: Clock) -> None:
+    clock.at(NOW + 1000)
+
+    rejected_and_unchanged(store, lambda: pair(store, credential_expires_at=NOW + 1601, result_expires_at=NOW + 1600))
+    assert pair(store, credential_expires_at=NOW + 1600, result_expires_at=NOW + 1600).authority is not None
+
+
+# --------------------------------------------------------------------------------------------------
+# capacity counts only live entries
+# --------------------------------------------------------------------------------------------------
+
+
+def full_consumed(expires_at: int) -> list[dict[str, Any]]:
+    return [
+        {"digest": encode_base64url(digest(i), exact_length=32), "expires_at": expires_at} for i in range(MAX_CONSUMED)
+    ]
+
+
+def full_results(expires_at: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "expires_at": expires_at,
+            "id": ident(index),
+            "kind": "bootstrap-confirm",
+            "request_hash": encode_base64url(digest(index), exact_length=32),
+            "response": encode_base64url(b"r", exact_length=1),
+        }
+        for index in range(MAX_RESULTS)
+    ]
+
+
+def test_expired_entries_at_capacity_do_not_block_a_pairing_or_a_recovery(
+    store: ControlAuthorityStore, keys: StateAuthenticationKeyStore, clock: Clock
+) -> None:
+    expiry = NOW + 1000
+    fresh = at_limit(store, keys, consumed=full_consumed(expiry), results=full_results(expiry))
+    clock.at(expiry + TOMBSTONE_GRACE_SECONDS + 1)
+    now = expiry + TOMBSTONE_GRACE_SECONDS + 1
+
+    paired = pair(
+        fresh,
+        credential_digest=digest(200),
+        bootstrap_id=ident(200),
+        request_hash=digest(201),
+        credential_expires_at=now + 600,
+        result_expires_at=now + 600,
+    )
+    recovered = recover(
+        fresh,
+        credential_digest=digest(202),
+        recovery_id=ident(202),
+        request_hash=digest(203),
+        credential_expires_at=now + 600,
+        result_expires_at=now + 600,
+    )
+
+    assert paired.authority is not None
+    assert recovered.authority is None
+    assert len(recovered.consumed) == 2 and len(recovered.results) == 2
+
+
+@pytest.mark.parametrize("filled", ["consumed", "results"])
+def test_live_entries_at_capacity_still_refuse_a_pairing_and_change_nothing(
+    store: ControlAuthorityStore, keys: StateAuthenticationKeyStore, filled: str
+) -> None:
+    changes = {"consumed": full_consumed(NOW + 1000)} if filled == "consumed" else {"results": full_results(NOW + 1000)}
+    fresh = at_limit(store, keys, **changes)
+
+    reason = unchanged(fresh, lambda: pair(fresh, credential_digest=digest(200), bootstrap_id=ident(200)))
+
+    assert reason is AuthorityRefusal.CAPACITY_EXCEEDED
+
+
+@pytest.mark.parametrize("filled", ["consumed", "results"])
+def test_live_entries_at_capacity_still_refuse_a_recovery_and_change_nothing(
+    store: ControlAuthorityStore, keys: StateAuthenticationKeyStore, filled: str
+) -> None:
+    pair(store)
+    changes = {"consumed": full_consumed(NOW + 1000)} if filled == "consumed" else {"results": full_results(NOW + 1000)}
+    fresh = forge(store, keys, **changes)
+
+    reason = unchanged(fresh, lambda: recover(fresh, credential_digest=digest(200), recovery_id=ident(200)))
+
+    assert reason is AuthorityRefusal.CAPACITY_EXCEEDED
+    assert fresh.load().authority is not None
+
+
+# --------------------------------------------------------------------------------------------------
+# the clock is read under the store lock, inside the update
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("operation", OPERATIONS)
+def test_the_clock_is_read_inside_the_document_update_while_the_lock_is_held(
+    tmp_path: Path,
+    keys: StateAuthenticationKeyStore,
+    operation: Callable[[ControlAuthorityStore], Callable[..., ControlAuthority]],
+) -> None:
+    events: list[str] = []
+    holder: list[ControlAuthorityStore] = []
+
+    def clock() -> datetime:
+        events.append("clock-locked" if holder and holder[0]._lock.locked() else "clock-unlocked")
+        if holder and "update" in events:
+            events.append("clock-in-update")
+        return T0
+
+    store = ControlAuthorityStore(tmp_path / "authority", keys=keys, clock=clock)
+    holder.append(store)
+    run = operation(store)
+    events.clear()
+    real_update = store._document.update
+
+    def recording_update(build: Callable[..., Any]) -> Any:
+        def recording_build(current: Any) -> Any:
+            events.append("update")
+            return build(current)
+
+        return real_update(recording_build)
+
+    store._document.update = recording_update  # type: ignore[method-assign]
+
+    run()
+
+    assert "clock-unlocked" not in events
+    assert "clock-in-update" in events
+    assert events.index("update") < events.index("clock-in-update")
 
 
 def test_a_naive_clock_is_rejected(tmp_path: Path, keys: StateAuthenticationKeyStore) -> None:
