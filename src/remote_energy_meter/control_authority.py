@@ -36,11 +36,24 @@ Rules checked on each consuming transaction, in this order for the credential: a
 Task 7.4 contract: the caller passes the HMAC-verified credential's embedded expiry as ``credential_expires_at`` and
 also as ``result_expires_at``. The spec's retry window and tombstone (``expires_at + 300`` seconds) are defined on that
 instant. The store accepts any ``result_expires_at`` in ``(now, credential_expires_at]``, but only the credential
-expiry satisfies the spec. 7.4 must treat the ``ValueError`` above as an internal or clock-skew error, or range-check
-the embedded expiry first and map it to a refusal, so a hostile credential never becomes a 500.
+expiry satisfies the spec. 7.4 must range-check the embedded expiry first and map an out-of-range one to a refusal, so
+a hostile credential never becomes a server error; a ``ValueError`` that still reaches it is an internal or clock-skew
+error.
 
-The store assumes a non-regressing wall clock: a backward step of more than ``TOMBSTONE_GRACE_SECONDS`` can make a
-compacted consumed credential look unexpired again. Any monotonic-clock guard is the caller's, or a pending decision.
+The clock guard: the record also stores ``latest_seen``, the highest server time any transaction has acted on. Every
+transaction and every lookup acts on ``max(clock, latest_seen)``, and each write stores the time it acted on, so time
+never goes backwards for this store. A wall clock that steps back (an NTP correction, a resumed virtual machine)
+therefore cannot make a compacted, already-consumed credential look unexpired again. (An expired result body stays
+gone after such a step because every write blanks it, and the lookup clamp repeats that rule as defence in depth.)
+
+The guard has a cost. A write needs a credential expiring within ten minutes after the write, so the add-on clock at a
+write cannot be more than about ten minutes away from the clock that issued the credential. That bounds the
+disagreement between the two clocks, not the error against real time: both normally share one host clock, so a write
+made while that clock is wrong-forward stores the error. Until real time reaches ``latest_seen`` the store refuses
+every credential expiring before it, pairing and recovery alike (``credential_expired``), and nothing in the store
+clears it; deleting the document would also discard the revocation marks. Task 7.4 must surface this refusal
+distinctly, and the post-restore quarantine owns any operator remedy. After a restore from an older backup the guard
+is only as recent as that backup, which the quarantine also owns.
 
 Capacities: at most 64 retained consumed-credential digests (``MAX_CONSUMED``) and 32 retained results
 (``MAX_RESULTS``, bodies and tombstones), and a recorded response of at most 2 KiB (``MAX_RESPONSE_BYTES``). A
@@ -124,6 +137,7 @@ _RECORD_KEYS: Final = frozenset(
         "consumed",
         "key_high_water",
         "key_revoked_through",
+        "latest_seen",
         "recovery_high_water",
         "results",
         "spki_revoked_through",
@@ -230,6 +244,8 @@ class ControlAuthority:
     recovery_high_water: int
     consumed: tuple[ConsumedCredential, ...]
     results: tuple[ExactResult, ...]
+    latest_seen: int = 0
+    """The highest server time (Unix seconds) any transaction has acted on; the clock guard never goes below it."""
 
     @property
     def next_key_generation(self) -> int:
@@ -321,8 +337,9 @@ class ControlAuthorityStore:
         """
         _check_identifier(identifier, "identifier")
         _check_digest(request_hash, "request_hash")
-        now = self._now()
-        for result in self.load().results:
+        state = self.load()
+        now = max(self._now(), state.latest_seen)  # the clock guard: time never goes below what was already acted on
+        for result in state.results:
             if result.kind is kind and result.identifier == identifier:
                 if now >= result.expires_at or result.response is None:
                     return ResultLookup()
@@ -554,9 +571,13 @@ class ControlAuthorityStore:
         with self._lock:
 
             def build(current: StoredDocument | None) -> Mapping[str, JsonValue]:
-                now = self._now()  # one read, taken with the store lock held and next to the state read
+                clock_now = self._now()  # one read, taken with the store lock held and next to the state read
                 state = _EMPTY if current is None else self._decode(current.record)
-                return self._encode(change(state, now))
+                # The clock guard: act on the later of the clock and the highest time ever acted on, so a clock that
+                # stepped back cannot revive a compacted credential or reopen an expired result window.
+                now = max(clock_now, state.latest_seen)
+                changed = change(state, now)
+                return self._encode(replace(changed, latest_seen=now))  # now is never below the stored latest_seen
 
             return self._decode(self._document.update(build).record)
 
@@ -604,6 +625,7 @@ class ControlAuthorityStore:
             "consumed": consumed,
             "key_high_water": state.key_high_water,
             "key_revoked_through": state.key_revoked_through,
+            "latest_seen": state.latest_seen,
             "recovery_high_water": state.recovery_high_water,
             "results": results,
             "spki_revoked_through": state.spki_revoked_through,
@@ -617,11 +639,13 @@ class ControlAuthorityStore:
         raw_consumed, raw_results = record["consumed"], record["results"]
         key_high_water, key_revoked_through = record["key_high_water"], record["key_revoked_through"]
         recovery_high_water, spki_revoked_through = record["recovery_high_water"], record["spki_revoked_through"]
+        latest_seen = record["latest_seen"]
         if (
             not _is_uint64(key_high_water)
             or not _is_uint64(key_revoked_through)
             or not _is_uint64(recovery_high_water)
             or not _is_uint64(spki_revoked_through)
+            or not _is_uint64(latest_seen)
             or type(raw_consumed) is not list
             or type(raw_results) is not list
             or len(raw_consumed) > MAX_CONSUMED
@@ -646,10 +670,19 @@ class ControlAuthorityStore:
             and authority.spki_generation > spki_revoked_through
         ):
             problems.append("the authorized generations are revoked or were never issued")
+        if authority is not None and authority.authorized_at > latest_seen:
+            problems.append("the key was authorized after the latest time the store acted on")
         if problems:
             raise SecureStoreError(StoreFault.IDENTITY_INCONSISTENT, f"{where}: {'; '.join(problems)}")
         return ControlAuthority(
-            authority, key_high_water, key_revoked_through, spki_revoked_through, recovery_high_water, consumed, results
+            authority,
+            key_high_water,
+            key_revoked_through,
+            spki_revoked_through,
+            recovery_high_water,
+            consumed,
+            results,
+            latest_seen,
         )
 
     @staticmethod
