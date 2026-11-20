@@ -14,8 +14,10 @@ from remote_energy_meter.retention_tables import (
     FULL_RESULT_SECONDS,
     MARKER_SECONDS,
     MAX_BODY_BYTES,
+    MAX_FULL_BODY_BYTES,
     MAX_NONCES,
     MAX_OPERATIONS,
+    MAX_REQUEST_LIFETIME_SECONDS,
     MAX_RETRIES,
     ExactRetry,
     ExactRetryTable,
@@ -122,9 +124,9 @@ def test_a_replay_inside_the_window_is_refused_at_its_last_valid_instant() -> No
 def test_an_expired_nonce_is_forgotten_so_the_same_value_may_be_used_by_a_later_request() -> None:
     table = NonceTable().consume(nonce(1), NOW + 60, NOW)
 
-    later = table.consume(nonce(1), NOW + 200, NOW + 61)
+    later = table.consume(nonce(1), NOW + 150, NOW + 61)
 
-    assert later.entries == ((nonce(1), NOW + 200),)
+    assert later.entries == ((nonce(1), NOW + 150),)
 
 
 def test_the_capacity_counts_only_unexpired_nonces_and_never_evicts() -> None:
@@ -135,8 +137,8 @@ def test_the_capacity_counts_only_unexpired_nonces_and_never_evicts() -> None:
 
     assert refusal_of(lambda: full.consume(b"\xff" * 16, NOW + 60, NOW)) is TableRefusal.CAPACITY_EXCEEDED
     assert len(full.entries) == MAX_NONCES
-    after = full.consume(b"\xff" * 16, NOW + 200, NOW + 61)  # every earlier nonce has expired and is compacted away
-    assert after.entries == ((b"\xff" * 16, NOW + 200),)
+    after = full.consume(b"\xff" * 16, NOW + 150, NOW + 61)  # every earlier nonce has expired and is compacted away
+    assert after.entries == ((b"\xff" * 16, NOW + 150),)
 
 
 @pytest.mark.parametrize(
@@ -239,7 +241,7 @@ def test_a_second_result_for_the_same_request_is_refused_until_the_first_expires
     table = ExactRetryTable().record(retry(), NOW)
 
     assert refusal_of(lambda: table.record(retry(nonce=nonce(7)), NOW + 1)) is TableRefusal.EXISTS
-    assert table.record(retry(expires_at=NOW + 200), NOW + 61).entries[0].expires_at == NOW + 200
+    assert table.record(retry(expires_at=NOW + 150), NOW + 61).entries[0].expires_at == NOW + 150
 
 
 def test_a_result_for_an_already_expired_request_is_refused() -> None:
@@ -477,3 +479,82 @@ def test_the_module_exports_its_public_names_and_encodes_to_canonical_json() -> 
         assert hasattr(retention_tables, name)
     table = OperationResultTable().record(result(), NOW)
     assert render_canonical_json({"results": table.to_json()}, max_depth=6)
+
+
+# --------------------------------------------------------------------------------------------------
+# bounded expiry and bounded size
+# --------------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(("offset", "accepted"), [(0, True), (MAX_REQUEST_LIFETIME_SECONDS, True)])
+def test_a_request_expiry_up_to_the_longest_valid_lifetime_is_accepted(offset: int, accepted: bool) -> None:
+    assert NonceTable().consume(nonce(1), NOW + offset, NOW).entries
+    assert ExactRetryTable().record(retry(expires_at=NOW + offset), NOW).entries
+    assert accepted
+
+
+@pytest.mark.parametrize("offset", [MAX_REQUEST_LIFETIME_SECONDS + 1, 10_000, 2**64 - 1 - NOW])
+def test_a_request_expiry_beyond_the_longest_valid_lifetime_is_rejected(offset: int) -> None:
+    with pytest.raises(ValueError, match="more than 90 seconds"):
+        NonceTable().consume(nonce(1), NOW + offset, NOW)
+    with pytest.raises(ValueError, match="more than 90 seconds"):
+        ExactRetryTable().record(retry(expires_at=NOW + offset), NOW)
+
+
+def test_a_hostile_far_future_expiry_cannot_pin_a_slot() -> None:
+    table = NonceTable()
+    for index in range(MAX_NONCES):
+        table = table.consume(index.to_bytes(16, "big"), NOW + MAX_REQUEST_LIFETIME_SECONDS, NOW)
+
+    # Every legitimate entry is gone ninety-one seconds later, so the table is usable again.
+    later = NOW + MAX_REQUEST_LIFETIME_SECONDS + 1
+    assert table.consume(b"\xee" * 16, later + 5, later).entries == ((b"\xee" * 16, later + 5),)
+
+
+def full_result(n: int, size: int) -> OperationResult:
+    return result(operation_id=encode_base64url(n.to_bytes(16, "big"), exact_length=16), body=b"x" * size)
+
+
+def test_the_bytes_held_in_full_operation_results_are_capped_and_freed_at_the_marker_boundary() -> None:
+    table = OperationResultTable()
+    per = MAX_FULL_BODY_BYTES // MAX_BODY_BYTES
+    for index in range(per):
+        table = table.record(full_result(index, MAX_BODY_BYTES), NOW)
+
+    assert refusal_of(lambda: table.record(full_result(per, 1), NOW)) is TableRefusal.CAPACITY_EXCEEDED
+    later = NOW + FULL_RESULT_SECONDS
+    freed = table.record(replace(full_result(per, 1), committed_at=later), later)
+    assert len(freed.entries) == per + 1  # the earlier results became markers and no longer count
+
+
+def test_a_decoded_table_may_not_hold_more_full_body_bytes_than_the_cap() -> None:
+    per = MAX_FULL_BODY_BYTES // MAX_BODY_BYTES
+    table = OperationResultTable(tuple(full_result(i, MAX_BODY_BYTES) for i in range(per + 1)))
+
+    with pytest.raises(ValueError, match="more bytes"):
+        OperationResultTable.from_json(table.to_json())
+
+
+def test_all_three_tables_at_capacity_fit_comfortably_inside_one_document() -> None:
+    nonces = NonceTable()
+    for index in range(MAX_NONCES):
+        nonces = nonces.consume(index.to_bytes(16, "big"), NOW + MAX_REQUEST_LIFETIME_SECONDS, NOW)
+    retries = ExactRetryTable()
+    for index in range(MAX_RETRIES):
+        retries = retries.record(retry(request_hash=index.to_bytes(32, "big"), body=b"x" * MAX_BODY_BYTES), NOW)
+    operations = OperationResultTable()
+    batch = MAX_FULL_BODY_BYTES // MAX_BODY_BYTES
+    clock = NOW
+    for start in range(0, MAX_OPERATIONS, batch):
+        for index in range(start, min(start + batch, MAX_OPERATIONS)):
+            operations = operations.record(replace(full_result(index, MAX_BODY_BYTES), committed_at=clock), clock)
+        clock += FULL_RESULT_SECONDS  # the batch becomes markers, freeing the body budget for the next
+    assert len(operations.entries) == MAX_OPERATIONS
+
+    document = render_canonical_json(
+        {"nonces": nonces.to_json(), "operations": operations.to_json(), "retries": retries.to_json()},
+        max_depth=6,
+        max_length=4 << 20,
+    )
+
+    assert len(document) < 3 * 1024 * 1024  # under three quarters of the 4 MiB document ceiling

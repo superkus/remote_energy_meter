@@ -61,10 +61,22 @@ _nonce_tables = st.lists(st.tuples(_nonces, _times), max_size=8, unique_by=lambd
 )
 
 
-@given(_nonce_tables, _nonces, _times)
+@given(_nonce_tables.filter(lambda table: bool(table.entries)), st.data())
 @settings(max_examples=300, deadline=None)
-def test_compaction_never_changes_whether_a_nonce_is_retained(table: NonceTable, nonce: bytes, now: int) -> None:
+def test_compaction_never_changes_whether_a_retained_nonce_is_found(table: NonceTable, data: st.DataObject) -> None:
+    """Query a nonce that is really in the table, at instants around its expiry, so both answers occur."""
+    nonce, expires_at = data.draw(st.sampled_from(table.entries))
+    now = expires_at + data.draw(st.integers(min_value=-2, max_value=2))
+
     assert table.contains(nonce, now) == table.compact(now).contains(nonce, now)
+    assert table.contains(nonce, now) is (now <= expires_at)
+
+
+@given(_nonce_tables, _nonces, _times)
+@settings(max_examples=100, deadline=None)
+def test_an_unknown_nonce_is_never_found(table: NonceTable, nonce: bytes, now: int) -> None:
+    if nonce not in {held for held, _ in table.entries}:
+        assert not table.contains(nonce, now)
 
 
 @given(_nonce_tables)
@@ -93,19 +105,27 @@ _retry_tables = st.lists(
 ).map(lambda entries: ExactRetryTable(tuple(entries)))
 
 
-@given(_retry_tables, _small, _nonces, _times)
+@given(_retry_tables.filter(lambda table: bool(table.entries)), st.data())
 @settings(max_examples=300, deadline=None)
-def test_compaction_never_changes_a_retry_answer(table: ExactRetryTable, n: int, nonce: bytes, now: int) -> None:
+def test_compaction_never_changes_a_retry_answer_for_a_retained_request(
+    table: ExactRetryTable, data: st.DataObject
+) -> None:
+    """Query the exact request of an entry in the table, around its expiry, so hits and misses both occur."""
+    entry = data.draw(st.sampled_from(table.entries))
+    now = entry.expires_at + data.draw(st.integers(min_value=-2, max_value=2))
     arguments = {
-        "purpose": "rem-test-v1",
-        "request_hash": bytes([n]) * 32,
-        "nonce": nonce,
-        "key_generation": 1,
-        "proposed_generation": None,
+        "purpose": entry.purpose,
+        "request_hash": entry.request_hash,
+        "nonce": entry.nonce,
+        "key_generation": entry.key_generation,
+        "proposed_generation": entry.proposed_generation,
         "now": now,
     }
 
-    assert table.lookup(**arguments) == table.compact(now).lookup(**arguments)  # type: ignore[arg-type]
+    answer = table.lookup(**arguments)  # type: ignore[arg-type]
+
+    assert answer == table.compact(now).lookup(**arguments)  # type: ignore[arg-type]
+    assert (answer is not None) is (now <= entry.expires_at)
 
 
 @given(_retry_tables)

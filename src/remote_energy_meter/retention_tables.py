@@ -26,8 +26,13 @@ Lookups decide from the recorded instants only. Physical compaction (dropping bo
 ``record``/``consume`` but never changes an answer, so a lagging cleanup cannot return a result after its boundary.
 
 Every table is capacity-bounded; a transaction that would exceed the bound is refused (:class:`TableRefusal`), never
-evicting another entry. Bodies are plain bytes: **never record a response that contains key material** here; the MQTT
-key-provisioning response has its own encrypted record (task 7.2.1).
+evicting another entry. A nonce or retry expiry must lie within ``MAX_REQUEST_LIFETIME_SECONDS`` of now (the longest a
+valid signed request lives), so no entry outlives its use, and the bytes of operation bodies held in full are capped so
+the three tables together fit one authenticated document. Bodies are plain bytes: **never record a response that
+contains key material** here; the MQTT key-provisioning response has its own encrypted record (task 7.2.1).
+
+Tables are immutable: ``consume`` and ``record`` return the new table, which the caller must keep and store. Dropping
+the returned value silently loses the entry (a consumed nonce would be accepted again).
 
 Each table encodes to and decodes from plain JSON values with strict validation (``ValueError`` on anything else), so a
 domain store can fold them into its record and treat a decode failure as a malformed record.
@@ -35,6 +40,7 @@ domain store can fold them into its record and treat a decode failure as a malfo
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from typing import Final, TypeGuard
@@ -46,8 +52,10 @@ __all__ = [
     "FULL_RESULT_SECONDS",
     "MARKER_SECONDS",
     "MAX_BODY_BYTES",
+    "MAX_FULL_BODY_BYTES",
     "MAX_NONCES",
     "MAX_OPERATIONS",
+    "MAX_REQUEST_LIFETIME_SECONDS",
     "MAX_RETRIES",
     "ExactRetry",
     "ExactRetryTable",
@@ -69,6 +77,10 @@ MAX_RETRIES: Final = 256
 MAX_OPERATIONS: Final = 4096
 MAX_BODY_BYTES: Final = 2048
 """Cap on a recorded response body."""
+MAX_FULL_BODY_BYTES: Final = 512 * 1024
+"""Cap on the bytes of all operation-result bodies still held in full, so the table fits one document."""
+MAX_REQUEST_LIFETIME_SECONDS: Final = 90
+"""A valid signed request expires at most this long after receipt: created up to 30 s ahead plus a 60 s lifetime."""
 
 _UINT64_MAX: Final = 2**64 - 1
 _NONCE_BYTES: Final = 16
@@ -103,6 +115,12 @@ def _check_instant(value: int, name: str) -> None:
         raise ValueError(f"{name} must be a uint64 Unix time")
 
 
+def _check_request_expiry(expires_at: int, now: int) -> None:
+    """Reject a request expiry no valid signed request can have, so no entry is retained far beyond its use."""
+    if expires_at > now + MAX_REQUEST_LIFETIME_SECONDS:
+        raise ValueError(f"expires_at is more than {MAX_REQUEST_LIFETIME_SECONDS} seconds after now")
+
+
 def _check_bytes(value: bytes, length: int, name: str) -> None:
     if type(value) is not bytes or len(value) != length:
         raise ValueError(f"{name} must be exactly {length} bytes")
@@ -133,6 +151,10 @@ def _check_purpose(value: str) -> None:
         or not all(c.islower() or c.isdigit() or c == "-" for c in value)
     ):
         raise ValueError("purpose must be 1 to 64 lowercase ASCII letters, digits or hyphens")
+
+
+def _full_body_bytes(entries: Sequence[OperationResult]) -> int:
+    return sum(len(entry.body) for entry in entries if entry.body is not None)
 
 
 def _expect_object(raw: JsonValue, keys: frozenset[str]) -> dict[str, JsonValue]:
@@ -172,6 +194,7 @@ class NonceTable:
         _check_bytes(nonce, _NONCE_BYTES, "nonce")
         _check_instant(expires_at, "expires_at")
         _check_instant(now, "now")
+        _check_request_expiry(expires_at, now)
         if expires_at < now:
             raise TableRefused(TableRefusal.EXPIRED, "the request has expired")
         live = self.compact(now).entries
@@ -280,6 +303,7 @@ class ExactRetryTable:
         _check_body(entry.body)
         _check_instant(entry.expires_at, "expires_at")
         _check_instant(now, "now")
+        _check_request_expiry(entry.expires_at, now)
         if entry.expires_at < now:
             raise TableRefused(TableRefusal.EXPIRED, "the request has expired")
         live = self.compact(now).entries
@@ -449,6 +473,8 @@ class OperationResultTable:
             raise TableRefused(TableRefusal.EXISTS, "that operation identifier is already recorded")
         if len(live) >= MAX_OPERATIONS:
             raise TableRefused(TableRefusal.CAPACITY_EXCEEDED, "too many retained operation results")
+        if _full_body_bytes(live) + len(result.body) > MAX_FULL_BODY_BYTES:
+            raise TableRefused(TableRefusal.CAPACITY_EXCEEDED, "too many bytes held in full operation results")
         return OperationResultTable((*live, result))
 
     def compact(self, now: int) -> OperationResultTable:
@@ -503,4 +529,6 @@ class OperationResultTable:
             )
         if len({entry.operation_id for entry in entries}) != len(entries):
             raise ValueError("an operation identifier is recorded twice")
+        if _full_body_bytes(entries) > MAX_FULL_BODY_BYTES:
+            raise ValueError("more bytes are held in full operation results than the cap allows")
         return cls(tuple(entries))

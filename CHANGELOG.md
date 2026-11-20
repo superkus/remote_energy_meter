@@ -117,7 +117,10 @@ All notable changes to this project are documented here. The format follows
   `OperationResultTable` keeps a roster action's result in full for 24 hours, then as a digest-only marker for 30
   days, then ignores it. A signed request is valid through its own expiry instant, so nonces and retries use inclusive
   windows, while operation results use half-open ones. Lookups decide from recorded instants only, so a lagging cleanup
-  never returns a result after its boundary, and each table is capacity-bounded and refuses rather than evicting.
+  never returns a result after its boundary. Each table is capacity-bounded and refuses rather than evicting; a nonce or
+  retry expiry may lie at most 90 seconds ahead (the longest a valid signed request lives), so a hostile far-future
+  expiry cannot pin a slot, and the bytes of operation bodies held in full are capped so the three tables together fit
+  one authenticated document.
 
 ### Changed
 
