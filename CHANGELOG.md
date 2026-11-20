@@ -121,6 +121,17 @@ All notable changes to this project are documented here. The format follows
   retry expiry may lie at most 90 seconds ahead (the longest a valid signed request lives), so a hostile far-future
   expiry cannot pin a slot, and the bytes of operation bodies held in full are capped so the three tables together fit
   one authenticated document.
+- Added restore checks (`remote_energy_meter.restore_guard`); nothing uses them yet. `compare_control_state` compares the
+  add-on's stored control key, SPKI and generations with what the integration presents and reports whether the add-on
+  or the integration was rolled back, a pin was substituted, the peer holds a revoked generation, or the generations
+  disagree in opposite directions; only an exact match leaves control enabled. For a declared full-system restore, an
+  authenticated durable post-restore quarantine record holds three obligations: a fresh control pairing, MQTT
+  re-provisioning, and the durable deletion of every restored reporter identity. While it is open, the restored
+  control authority cannot administer, a restored reporter cannot obtain a session or have a report accepted, and
+  MQTT v2 stays off; the record is released only when all three are done, and declaring again resets every
+  obligation so progress carried in restored data never counts. The gate treats a damaged, tampered or unreadable
+  record as blocked. The add-on cannot notice a restore by itself, so a restore that is never declared is not
+  quarantined; how the declaration reaches the add-on is left to the bootstrap work.
 
 ### Changed
 

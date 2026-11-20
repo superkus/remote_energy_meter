@@ -124,7 +124,7 @@ documentation pass.
 
 - [ ] 4. Add configuration, durable PKI, roster, and one-use token state
   - _Requirements: 1.5, 2.2, 3.1, 4.5, 5.1, 5.2, 5.3, 5.4, 6.5, 7.3, 7.6, 8.1_
-  - [ ] 4.1 First extract and promote the existing `state_store.py` `_write_atomically` and `_fsync_directory`
+  - [x] 4.1 First extract and promote the existing `state_store.py` `_write_atomically` and `_fsync_directory`
     mechanism into a shared persistence helper, keep `EnergyStateStore` using that helper, and preserve its regression
     tests. Then test and implement the atomic owner-only PKI, roster, token, revocation, control-authority, control-SPKI,
     and energy stores with that shared helper rather than a parallel writer. Preserve same-filesystem `O_EXCL`
@@ -139,6 +139,14 @@ documentation pass.
     reporter-authority quarantine transitions. Add encrypted backup/restore consistency coverage across multiple secret
     generations, prove restore never extends an embedded expiry, and prove missing or partial post-restore quarantine
     state blocks normal service.
+    - _Scope: 4.1 delivers the shared secure writer and fail-closed versioned and authenticated stores, the
+      state-authentication key, the control TLS identity, the generated reporter CA and leaf, the control authority
+      (pairing, recovery, consumed credentials, exact confirm and revoke results, clock guard), pure retention tables
+      for nonces, exact retries and 24-hour/30-day operation results, and the post-restore quarantine with the
+      one-sided restore comparator, with whole-tree restore scenarios. Reassigned to the tasks that own the behaviour:
+      the reporter roster and lifecycle (4.2); managed-token operation and revocation records (4.3); reporter-key and
+      control-key rotation challenge records, which embed the retention tables in their domain stores (7.2.5, 7.2.6);
+      MQTT key and wrapping-key state (7.2.1, 9.1); and how a declared restore reaches the add-on (7.4)._
     - _Requirements: 2.2, 5.1, 5.3, 5.4, 5.5, 7.5a, 7.5d, 7.5e, 7.5f_
   - [ ] 4.2 Test and implement reporter lifecycle, stable IDs, public-key rotation, revocation tombstones, and
     capacities.
