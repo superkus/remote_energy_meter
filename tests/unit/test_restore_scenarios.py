@@ -1,9 +1,11 @@
-"""Restore scenarios across every durable store: a whole data tree rolled back to an older snapshot.
+"""Restore scenarios across the durable stores: a whole data tree rolled back to an older snapshot.
 
-Each store is already tested alone. This pins how they behave *together* when an administrator restores an older backup
-of the whole tree, with several secret generations in between: every record still verifies (it was authentic when it was
-written), a one-sided restore is caught by comparing against the peer, a declared coordinated restore is held in
-quarantine until each obligation is met, and nothing restored regains a lifetime it had already used up.
+Each store is already tested alone. This pins how the state key, control identity, reporter PKI, control authority and
+quarantine record behave *together* when an administrator restores an older backup of the whole tree, with two control
+key generations in between: every record still verifies (it was authentic when it was written), a one-sided restore is
+caught by comparing against the peer, a declared coordinated restore is held in quarantine until each obligation is
+met, and nothing restored regains a lifetime it had already used up. The state-authentication key itself never rotates,
+and the energy store is covered by its own tests.
 """
 
 from __future__ import annotations
@@ -11,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import shutil
+import stat
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -155,6 +158,7 @@ def tree(tmp_path: Path) -> Tree:
     keys.create()
     identity_store.create()
     pki.create(["ha.example.com"])
+    instance.stores()[4].create()  # the add-on creates its clear quarantine record when it first initializes
     return instance
 
 
@@ -172,6 +176,8 @@ def test_an_older_snapshot_of_the_whole_tree_still_verifies_but_is_one_generatio
 
     tree.restore(snapshot_one)
 
+    for directory in sorted(tree.root.iterdir()):
+        assert stat.S_IMODE(directory.stat().st_mode) == 0o700, directory.name  # copytree keeps the strict modes
     _keys, identity_store, pki, authority, _quarantine = tree.stores()
     restored = authority.load()
     assert restored.authority is not None and restored.authority.key_generation == 1
@@ -219,7 +225,7 @@ def test_a_coordinated_restore_cannot_be_detected_so_the_declaration_holds_servi
     state = quarantine.declare_restore([REPORTER])
 
     assert not evaluate_gate(quarantine).permitted
-    assert not state.control_administration_permitted and not state.reporter_may_operate(REPORTER)
+    assert not state.control_administration_permitted and not state.reporter_traffic_permitted
     # Re-pairing: recover the restored authority, then pair a fresh key under the next generation.
     tree.clock.seconds += 20
     tree.recover(4)

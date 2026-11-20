@@ -127,11 +127,13 @@ All notable changes to this project are documented here. The format follows
   disagree in opposite directions; only an exact match leaves control enabled. For a declared full-system restore, an
   authenticated durable post-restore quarantine record holds three obligations: a fresh control pairing, MQTT
   re-provisioning, and the durable deletion of every restored reporter identity. While it is open, the restored
-  control authority cannot administer, a restored reporter cannot obtain a session or have a report accepted, and
-  MQTT v2 stays off; the record is released only when all three are done, and declaring again resets every
-  obligation so progress carried in restored data never counts. The gate treats a damaged, tampered or unreadable
-  record as blocked. The add-on cannot notice a restore by itself, so a restore that is never declared is not
-  quarantined; how the declaration reaches the add-on is left to the bootstrap work.
+  control authority cannot administer, no reporter may obtain a challenge or session or have a report accepted
+  (including a restored identity missing from the declared list), and MQTT v2 stays off. MQTT re-provisioning and the
+  deletions need the fresh pairing first, because the new control performs them. The record is released only when all
+  three are done, and declaring again resets every obligation so progress carried in restored data never counts. The
+  record is created explicitly on first start; an absent, damaged or tampered record blocks service, and only a
+  declaration may start from an absent record. The add-on cannot notice a restore by itself, so a restore that is never
+  declared is not quarantined; how the declaration reaches the add-on is left to the bootstrap work (task 7.4).
 
 ### Changed
 

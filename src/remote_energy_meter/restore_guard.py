@@ -13,12 +13,18 @@ durable post-restore quarantine before normal service starts. :class:`Quarantine
 :class:`Quarantine` is the gate every service path asks:
 
 * restored control authority cannot administer reporters until a **fresh pairing** has replaced it;
-* a **restored reporter identity** may not obtain a session or have a report accepted until it has been durably deleted;
+* **reporter traffic** (challenges, sessions, reports) is refused for everyone until every restored identity has been
+  durably deleted, MQTT v2 re-provisioned and acknowledged, and control re-paired, so a restored identity that was
+  somehow left out of the declared list is blocked too;
 * **MQTT v2** stays disabled until it has been re-provisioned with a fresh key and acknowledged;
-* the quarantine is released only when all three are done.
+* the quarantine is released only when all three are done, and the later steps need the fresh pairing first: the new
+  control provisions MQTT and performs the deletions.
 
-A damaged or tampered record is an error from the authenticated store; :func:`evaluate_gate` turns every such error
-into "blocked", so a missing or partial marker fails closed.
+The record is created explicitly (:meth:`QuarantineStore.create`, by the add-on's first start, like the other durable
+identities). A record that is absent, damaged or tampered is an error from the authenticated store, and
+:func:`evaluate_gate` turns every such error into "blocked", so a missing or partial marker fails closed. Only
+:meth:`QuarantineStore.declare_restore` may start from an absent record: it is the recovery path after a restore that
+left none.
 
 What this module cannot do, and the open decision: it records and enforces the quarantine, but nothing here *notices* a
 restore. The add-on cannot tell on its own that Supervisor restored its data, and a restore overwrites ``/data``
@@ -41,7 +47,7 @@ from remote_energy_meter.authenticated_store import AuthenticatedDocumentStore, 
 from remote_energy_meter.control_authority import ControlAuthority
 from remote_energy_meter.key_material import require_aware
 from remote_energy_meter.protocol_v1 import JsonValue, ProtocolViolation, decode_base64url
-from remote_energy_meter.secure_store import SecureStoreError, StoredDocument, StoreFault
+from remote_energy_meter.secure_store import SecureStoreError, StoredDocument, StoreFault, ensure_private_directory
 
 __all__ = [
     "DOCUMENT_NAME",
@@ -171,6 +177,7 @@ class QuarantineRefusal(StrEnum):
     """Why a quarantine change was refused. A refusal changes nothing."""
 
     NOT_QUARANTINED = "not_quarantined"
+    CONTROL_NOT_REPAIRED = "control_not_repaired"
     OBLIGATIONS_OUTSTANDING = "obligations_outstanding"
 
 
@@ -213,13 +220,15 @@ class Quarantine:
         """Whether MQTT v2 may connect, publish, or apply retained state. Never while quarantined."""
         return not self.quarantined
 
-    def reporter_may_operate(self, reporter_id: str) -> bool:
-        """Whether ``reporter_id`` may obtain a session or have a report accepted.
+    @property
+    def reporter_traffic_permitted(self) -> bool:
+        """Whether any reporter may obtain a challenge or a session, or have a report accepted.
 
-        A restored identity stays blocked until it has been durably deleted; an identity enrolled from scratch after
-        the restore is not in the pending set and is not blocked by it (it still cannot publish: MQTT v2 is off).
+        While quarantined nobody may: the gates stay closed until every obligation is done, so a restored identity is
+        blocked even if it was missing from the declared list. Enrollment from scratch is a separate path and is not
+        gated here.
         """
-        return not self.quarantined or reporter_id not in self.pending_reporters
+        return not self.quarantined
 
     @property
     def outstanding(self) -> tuple[str, ...]:
@@ -276,6 +285,7 @@ class QuarantineStore:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self._clock = clock
+        self._directory = directory
         self._document = AuthenticatedDocumentStore(
             directory,
             DOCUMENT_NAME,
@@ -290,21 +300,43 @@ class QuarantineStore:
         """The record's path."""
         return self._document.path
 
-    def load(self) -> Quarantine:
-        """Read and verify the record; a never-written store is clear.
+    def create(self) -> Quarantine:
+        """Write the initial clear record, once. Call it when the add-on first initializes its durable state.
 
         Raises:
-            SecureStoreError: Any fault of the authenticated store, or ``MALFORMED`` for a record of the wrong shape.
+            SecureStoreError: ``IDENTITY_EXISTS`` when a record already exists (it is never replaced), including one
+                created while this call runs; any other fault of the authenticated store.
+        """
+        ensure_private_directory(self._directory)
+        if self._document.load() is not None:
+            raise SecureStoreError(StoreFault.IDENTITY_EXISTS, f"{self.path} already exists and is never replaced")
+        try:
+            self._document.create(self._encode(_CLEAR))
+        except SecureStoreError as error:
+            if error.fault is StoreFault.CONCURRENT_MODIFICATION:
+                detail = f"{self.path} was created by another writer and is never replaced"
+                raise SecureStoreError(StoreFault.IDENTITY_EXISTS, detail) from None
+            raise
+        return _CLEAR
+
+    def load(self) -> Quarantine:
+        """Read and verify the record.
+
+        Raises:
+            SecureStoreError: ``IDENTITY_MISSING`` when no record exists (a missing marker fails closed); any fault of
+                the authenticated store; ``MALFORMED`` or ``IDENTITY_INCONSISTENT`` for a record that breaks its rules.
         """
         document = self._document.load()
-        return _CLEAR if document is None else self._decode(document.record)
+        if document is None:
+            raise SecureStoreError(StoreFault.IDENTITY_MISSING, f"{self.path} does not exist")
+        return self._decode(document.record)
 
     def declare_restore(self, restored_reporters: Sequence[str]) -> Quarantine:
         """Place the add-on in quarantine for a declared restore, resetting every obligation.
 
         Declaring again, for example after restoring a backup that was itself taken during a quarantine, starts
         over: the flags are cleared and the pending set is replaced, so stale progress carried in restored data can
-        never count.
+        never count. This is the only change that may start from an absent record, because a restore may have left none.
 
         Args:
             restored_reporters: The identities that came back with the restored roster, each a canonical 43-character
@@ -320,7 +352,7 @@ class QuarantineStore:
         def change(current: Quarantine) -> Quarantine:
             return Quarantine(True, current.restore_generation + 1, declared_at, False, False, reporters)
 
-        return self._update(change)
+        return self._update(change, allow_absent=True)
 
     def mark_control_repaired(self) -> Quarantine:
         """Record that a fresh control pairing has replaced the restored authority.
@@ -333,22 +365,26 @@ class QuarantineStore:
     def mark_mqtt_reprovisioned(self) -> Quarantine:
         """Record that MQTT v2 was re-provisioned with a fresh key and the new record was acknowledged.
 
+        The fresh control provisions it, so the re-pairing must come first.
+
         Raises:
-            QuarantineRefused: ``NOT_QUARANTINED``.
+            QuarantineRefused: ``NOT_QUARANTINED`` or ``CONTROL_NOT_REPAIRED``.
         """
-        return self._update(lambda current: replace(_require_quarantined(current), mqtt_reprovisioned=True))
+        return self._update(lambda current: replace(_require_repaired(current), mqtt_reprovisioned=True))
 
     def dispose_reporter(self, reporter_id: str) -> Quarantine:
         """Record that a restored reporter identity was durably deleted. Idempotent: a retry after a crash is a no-op.
 
+        Only the fresh control authority can delete an identity, so the re-pairing must come first.
+
         Raises:
             ValueError: ``reporter_id`` is malformed.
-            QuarantineRefused: ``NOT_QUARANTINED``.
+            QuarantineRefused: ``NOT_QUARANTINED`` or ``CONTROL_NOT_REPAIRED``.
         """
         _check_reporter(reporter_id)
 
         def change(current: Quarantine) -> Quarantine:
-            held = _require_quarantined(current)
+            held = _require_repaired(current)
             return replace(held, pending_reporters=tuple(r for r in held.pending_reporters if r != reporter_id))
 
         return self._update(change)
@@ -372,8 +408,10 @@ class QuarantineStore:
 
     # -- internals --------------------------------------------------------------------------------
 
-    def _update(self, change: Callable[[Quarantine], Quarantine]) -> Quarantine:
+    def _update(self, change: Callable[[Quarantine], Quarantine], *, allow_absent: bool = False) -> Quarantine:
         def build(current: StoredDocument | None) -> Mapping[str, JsonValue]:
+            if current is None and not allow_absent:
+                raise SecureStoreError(StoreFault.IDENTITY_MISSING, f"{self.path} does not exist")
             state = _CLEAR if current is None else self._decode(current.record)
             return self._encode(change(state))
 
@@ -414,7 +452,7 @@ class QuarantineStore:
         ):
             raise malformed
         try:
-            reporters = _canonical_reporters([str(item) for item in pending])
+            reporters = _canonical_reporters([str(item) for item in pending])  # each already checked to be a str
         except ValueError:
             raise malformed from None
         if reporters != tuple(pending):
@@ -433,6 +471,16 @@ def _require_quarantined(current: Quarantine) -> Quarantine:
     if not current.quarantined:
         raise QuarantineRefused(QuarantineRefusal.NOT_QUARANTINED, "the add-on is not in post-restore quarantine")
     return current
+
+
+def _require_repaired(current: Quarantine) -> Quarantine:
+    held = _require_quarantined(current)
+    if not held.control_repaired:
+        raise QuarantineRefused(
+            QuarantineRefusal.CONTROL_NOT_REPAIRED,
+            "the restored control authority has not been replaced by a fresh pairing",
+        )
+    return held
 
 
 def _check_reporter(reporter_id: str) -> None:

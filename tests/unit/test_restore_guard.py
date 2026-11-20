@@ -186,6 +186,13 @@ def store(tmp_path: Path, keys: StateAuthenticationKeyStore) -> QuarantineStore:
     return QuarantineStore(tmp_path / "quarantine", keys=keys, clock=lambda: T0)
 
 
+@pytest.fixture
+def ready(store: QuarantineStore) -> QuarantineStore:
+    """A store the add-on has initialized: the clear record exists."""
+    store.create()
+    return store
+
+
 def refusal_of(operation: Callable[[], object]) -> QuarantineRefusal:
     with pytest.raises(QuarantineRefused) as caught:
         operation()
@@ -207,14 +214,57 @@ def declare_and_finish(store: QuarantineStore, reporters: list[str]) -> Quaranti
     return store.load()
 
 
-def test_a_never_written_store_is_clear_and_every_path_is_open(store: QuarantineStore) -> None:
+def test_a_record_that_was_never_created_is_missing_and_missing_fails_closed(store: QuarantineStore) -> None:
+    assert fault_of(store.load) is StoreFault.IDENTITY_MISSING
+    decision = evaluate_gate(store)
+    assert (decision.permitted, decision.reason) == (False, "quarantine_record_identity_missing")
+    for operation in (
+        store.mark_control_repaired,
+        store.mark_mqtt_reprovisioned,
+        lambda: store.dispose_reporter(reporter(1)),
+        store.release,
+    ):
+        assert fault_of(operation) is StoreFault.IDENTITY_MISSING
+    assert not store.path.exists()
+
+
+def test_creating_the_record_makes_every_path_open(store: QuarantineStore) -> None:
+    created = store.create()
     state = store.load()
 
-    assert not state.quarantined
+    assert created == state
+    assert not state.quarantined and state.restore_generation == 0
     assert state.normal_service_permitted and state.mqtt_v2_permitted and state.control_administration_permitted
-    assert state.reporter_may_operate(reporter(1))
+    assert state.reporter_traffic_permitted
     assert state.outstanding == ()
-    assert not store.path.exists()
+    assert evaluate_gate(store).permitted
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+
+
+def test_an_existing_record_is_never_replaced_by_create(ready: QuarantineStore) -> None:
+    ready.declare_restore([reporter(1)])
+    before = ready.path.read_bytes()
+
+    assert fault_of(ready.create) is StoreFault.IDENTITY_EXISTS
+    assert ready.path.read_bytes() == before
+
+
+def test_a_record_created_by_another_writer_meanwhile_is_reported_as_existing(
+    store: QuarantineStore, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, keys: StateAuthenticationKeyStore
+) -> None:
+    QuarantineStore(tmp_path / "quarantine", keys=keys, clock=lambda: T0).create()
+    winner = store.path.read_bytes()
+    monkeypatch.setattr(AuthenticatedDocumentStore, "load", lambda self: None)
+
+    assert fault_of(store.create) is StoreFault.IDENTITY_EXISTS
+    assert store.path.read_bytes() == winner
+
+
+def test_a_restore_that_left_no_record_can_still_be_declared(store: QuarantineStore) -> None:
+    """The recovery path: the restored data had no marker, so declaring starts from nothing."""
+    state = store.declare_restore([reporter(1)])
+
+    assert state.quarantined and state.restore_generation == 1
 
 
 def test_declaring_a_restore_quarantines_everything_restored(store: QuarantineStore) -> None:
@@ -226,8 +276,7 @@ def test_declaring_a_restore_quarantines_everything_restored(store: QuarantineSt
     assert not state.normal_service_permitted
     assert not state.control_administration_permitted
     assert not state.mqtt_v2_permitted
-    assert not state.reporter_may_operate(reporter(1)) and not state.reporter_may_operate(reporter(2))
-    assert state.reporter_may_operate(reporter(9))  # an identity enrolled from scratch is not a restored one
+    assert not state.reporter_traffic_permitted  # for every identity: even one missing from the declared list
     assert state.outstanding == (
         "control_repair",
         "mqtt_reprovision",
@@ -249,6 +298,13 @@ def test_duplicate_restored_reporters_collapse(store: QuarantineStore) -> None:
     assert store.declare_restore([reporter(1), reporter(1)]).pending_reporters == (reporter(1),)
 
 
+def test_an_identity_missing_from_the_declared_list_is_blocked_too(store: QuarantineStore) -> None:
+    """Reporter traffic is closed for everyone, not only for the identities that were listed."""
+    state = store.declare_restore([reporter(1)])
+
+    assert not state.reporter_traffic_permitted
+
+
 def test_a_fresh_control_pairing_reopens_administration_but_nothing_else(store: QuarantineStore) -> None:
     store.declare_restore([reporter(1)])
 
@@ -256,21 +312,36 @@ def test_a_fresh_control_pairing_reopens_administration_but_nothing_else(store: 
 
     assert state.control_administration_permitted  # the fresh authority is what deletes the restored identities
     assert not state.mqtt_v2_permitted and not state.normal_service_permitted
-    assert not state.reporter_may_operate(reporter(1))
+    assert not state.reporter_traffic_permitted
     assert state.outstanding == ("mqtt_reprovision", f"reporter:{reporter(1)}")
 
 
-def test_deleting_a_restored_reporter_releases_only_that_reporter(store: QuarantineStore) -> None:
+def test_deleting_a_restored_reporter_removes_it_from_the_pending_set_but_reopens_nothing(
+    store: QuarantineStore,
+) -> None:
     store.declare_restore([reporter(1), reporter(2)])
+    store.mark_control_repaired()
 
     state = store.dispose_reporter(reporter(1))
 
-    assert state.reporter_may_operate(reporter(1)) and not state.reporter_may_operate(reporter(2))
     assert state.pending_reporters == (reporter(2),)
+    assert not state.reporter_traffic_permitted  # traffic stays closed until the whole quarantine is released
+
+
+@pytest.mark.parametrize("step", ["mqtt", "dispose"])
+def test_mqtt_reprovisioning_and_deletion_need_the_fresh_pairing_first(store: QuarantineStore, step: str) -> None:
+    store.declare_restore([reporter(1)])
+    before = store.path.read_bytes()
+
+    operation = store.mark_mqtt_reprovisioned if step == "mqtt" else lambda: store.dispose_reporter(reporter(1))
+
+    assert refusal_of(operation) is QuarantineRefusal.CONTROL_NOT_REPAIRED
+    assert store.path.read_bytes() == before
 
 
 def test_disposing_a_reporter_is_idempotent_so_a_retry_after_a_crash_is_harmless(store: QuarantineStore) -> None:
     store.declare_restore([reporter(1)])
+    store.mark_control_repaired()
     first = store.dispose_reporter(reporter(1))
 
     assert store.dispose_reporter(reporter(1)) == first
@@ -304,12 +375,12 @@ def test_release_requires_every_obligation(store: QuarantineStore) -> None:
 @pytest.mark.parametrize("missing", ["control", "mqtt", "reporter"])
 def test_release_is_refused_while_any_single_obligation_is_open(store: QuarantineStore, missing: str) -> None:
     store.declare_restore([reporter(1)])
-    if missing != "control":
+    if missing != "control":  # the later steps need the fresh pairing first
         store.mark_control_repaired()
-    if missing != "mqtt":
-        store.mark_mqtt_reprovisioned()
-    if missing != "reporter":
-        store.dispose_reporter(reporter(1))
+        if missing != "mqtt":
+            store.mark_mqtt_reprovisioned()
+        if missing != "reporter":
+            store.dispose_reporter(reporter(1))
 
     assert refusal_of(store.release) is QuarantineRefusal.OBLIGATIONS_OUTSTANDING
     assert store.load().quarantined
@@ -323,15 +394,16 @@ def test_a_restore_with_no_reporters_needs_only_pairing_and_mqtt(store: Quaranti
     assert not store.release().quarantined
 
 
-def test_nothing_but_a_declaration_changes_a_clear_store(store: QuarantineStore) -> None:
+def test_nothing_but_a_declaration_changes_a_clear_store(ready: QuarantineStore) -> None:
+    before = ready.path.read_bytes()
     for operation in (
-        store.mark_control_repaired,
-        store.mark_mqtt_reprovisioned,
-        lambda: store.dispose_reporter(reporter(1)),
-        store.release,
+        ready.mark_control_repaired,
+        ready.mark_mqtt_reprovisioned,
+        lambda: ready.dispose_reporter(reporter(1)),
+        ready.release,
     ):
         assert refusal_of(operation) is QuarantineRefusal.NOT_QUARANTINED
-    assert not store.path.exists()
+    assert ready.path.read_bytes() == before
 
 
 def test_declaring_again_starts_over_so_progress_carried_in_restored_data_never_counts(store: QuarantineStore) -> None:
@@ -406,7 +478,8 @@ def test_a_naive_clock_is_rejected(tmp_path: Path, keys: StateAuthenticationKeyS
 # --------------------------------------------------------------------------------------------------
 
 
-def test_the_gate_permits_a_clear_store_and_blocks_a_quarantined_one(store: QuarantineStore) -> None:
+def test_the_gate_permits_a_clear_store_and_blocks_a_quarantined_one(ready: QuarantineStore) -> None:
+    store = ready
     clear = evaluate_gate(store)
     assert (clear.permitted, clear.reason) == (True, None)
 
