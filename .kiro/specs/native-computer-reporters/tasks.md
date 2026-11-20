@@ -108,7 +108,7 @@ documentation pass.
     `created`/expiry, signed nonce, and signature parameters. Reject every one-field mutation, route/purpose reuse,
     replay outside the endpoint's exact-retry rule, and any rewritten, normalized, aliased, or mismatched target.
     - _Scope: 3.2 delivers the stateless primitive checks only. Stateful replay and exact-retry rejection are delivered
-      by tasks 4.1 (durable replay and exact-result records), 7.2.1 (signed-control nonce consumption and exact-retry
+      by tasks 4.1 (the consumed-credential and exact-result records and the pure replay and retry tables), 7.2.1 (signed-control nonce consumption and exact-retry
       cache), and 10.2 (report replay and identical-retry handling)._
     - _Requirements: 3.1, 6.1, 7.5f_
   - [x] 3.3 Replace task 3.1's SAS index placeholders by implementing requirement 4.3's normative rendering: pin and
@@ -152,7 +152,10 @@ documentation pass.
   - [ ] 4.2 Test and implement reporter lifecycle, stable IDs, public-key rotation, revocation tombstones, and
     capacities. Consume the post-restore quarantine (`restore_guard.QuarantineStore`): a declared restore passes every
     restored reporter ID to `declare_restore`, reporter traffic stays closed until the quarantine is released, and a
-    restored identity's durable deletion calls `dispose_reporter` in the same transaction that removes it.
+    restored identity's deletion is made durable in the roster first; only then is `dispose_reporter` called, and only
+    while the add-on is quarantined. A crash between the two is repaired on start by calling `dispose_reporter`
+    (idempotent) for every pending reporter that is no longer in the roster. Never dispose before the deletion is
+    durable.
     - _Requirements: 2.2, 3.1, 8.1_
   - [ ] 4.3 Test and implement only the managed-enrollment durable-store primitives: owner-only atomic records for
     unique hashed token verifiers and bounded public operation/revocation state, expiry-plus-grace lookup and
