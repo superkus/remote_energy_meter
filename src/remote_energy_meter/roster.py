@@ -6,8 +6,9 @@ are always written together.
 
 **Identity.** A reporter's ID is the RFC 7638 thumbprint of its *initial* enrollment key and never changes. The key it
 signs with can be rotated (:meth:`RosterStore.rotate_key`); each rotation advances ``key_generation`` by exactly one.
-Every key is unique across the roster, so a signature identifies one reporter. A reporter that lost or may have lost
-its key is revoked and re-enrolled; there is no unauthenticated recovery.
+Every *current* key is unique across the roster, so a signature identifies one reporter. A key a reporter has rotated
+away from is not reserved: it stops identifying anyone, and the roster keeps no history of retired keys. A reporter
+that lost or may have lost its key is revoked and re-enrolled; there is no unauthenticated recovery.
 
 **Lifecycle.** :meth:`~RosterStore.activate` (reporter-confirmed activation) creates an ``active`` record. A
 reporter is ``active`` until :meth:`~RosterStore.revoke` makes it ``revoked``, which keeps the record, so its device,
@@ -523,7 +524,10 @@ class RosterStore:
     # -- transaction machinery --------------------------------------------------------------------
 
     def _now(self) -> int:
-        return int(require_aware(self._clock(), "clock").timestamp())
+        seconds = int(require_aware(self._clock(), "clock").timestamp())
+        if seconds < 0:
+            raise ValueError("clock must not be before 1970-01-01")
+        return seconds
 
     def _require(self, current: StoredDocument | None) -> Roster:
         if current is None:
@@ -681,6 +685,8 @@ class RosterStore:
                 problems.append("a reporter's revocation time disagrees with its state")
         if any(t.deleted_at_generation > generation or t.state_generation < 1 for t in tombstones):
             problems.append("a tombstone is ahead of the roster generation")
+        if any(r.key_thumbprint in set(ids) - {r.reporter_id} for r in reporters):
+            problems.append("a reporter's signing key is another reporter's ID")
         if problems:
             raise SecureStoreError(StoreFault.IDENTITY_INCONSISTENT, f"{self.path}: {'; '.join(sorted(set(problems)))}")
 

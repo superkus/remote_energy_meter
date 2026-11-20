@@ -803,6 +803,36 @@ def test_concurrent_activations_each_get_a_distinct_contiguous_generation(store:
 # --------------------------------------------------------------------------------------------------
 
 
+def test_a_clock_before_1970_is_refused_clearly(tmp_path: Path, keys: StateAuthenticationKeyStore) -> None:
+    store = RosterStore(tmp_path / "old", keys=keys, clock=lambda: datetime(1969, 12, 31, tzinfo=UTC))
+    store.create()
+
+    with pytest.raises(ValueError, match="1970"):
+        store.activate(new_jwk(), META)
+    with pytest.raises(ValueError, match="1970"):
+        store.revoke(fake_id(1))
+
+
+def test_a_signing_key_equal_to_another_reporters_id_is_refused_on_load(store: RosterStore) -> None:
+    first, _ = enroll(store)
+    second, _ = enroll(store)
+    record = raw_record(store)
+    by_id = {r["reporter_id"]: r for r in record["reporters"]}
+    by_id[second]["jwk"] = by_id[first]["jwk"]
+    by_id[second]["key_thumbprint"] = first
+    by_id[second]["key_generation"] = 2
+    by_id[second]["state_generation"] = 2
+    by_id[first]["jwk"] = new_jwk().decode("ascii")
+    by_id[first]["key_thumbprint"] = thumbprint(by_id[first]["jwk"].encode("ascii"))
+    by_id[first]["key_generation"] = 2
+    by_id[first]["state_generation"] = 2
+    forge(store, record)
+
+    with pytest.raises(SecureStoreError) as caught:
+        store.load()
+    assert caught.value.fault is StoreFault.IDENTITY_INCONSISTENT
+
+
 def test_a_naive_clock_is_refused(tmp_path: Path, keys: StateAuthenticationKeyStore) -> None:
     store = RosterStore(tmp_path / "naive", keys=keys, clock=lambda: datetime(2030, 1, 1))  # noqa: DTZ001
     store.create()

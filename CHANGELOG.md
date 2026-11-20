@@ -137,7 +137,7 @@ All notable changes to this project are documented here. The format follows
 - Added the validated reporter metadata value (`remote_energy_meter.reporter_metadata`: display name, platform,
   architecture, reporter version) and the durable reporter roster (`remote_energy_meter.roster`); nothing uses them
   yet. A reporter's ID is the thumbprint of its initial key and never changes; its signing key can be rotated, one key
-  generation at a time, and every key is unique across the roster. Revocation keeps the reporter's record; deletion
+  generation at a time, and every current key is unique across the roster. Revocation keeps the reporter's record; deletion
   leaves a tombstone until its cleanup completes. At most 1,000 reporters and 1,000 pending cleanups are held, and a
   change past either limit is refused with nothing written. One authenticated document holds the reporters, the
   tombstones and the `roster_generation` cursor, so a change, the new cursor and the event it produces are written
