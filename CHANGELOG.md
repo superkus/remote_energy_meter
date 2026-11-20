@@ -112,6 +112,9 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- Refreshed the hash-locked runtime set: `pydantic` 2.14.3 to 2.14.4 and `pydantic-core` 2.50.4 to 2.50.5, both patch
+  releases. `pydantic` is allowed as a range, so the lock file goes stale whenever it publishes a release, and CI's
+  lock-consistency check then fails until the lock is regenerated.
 - The energy state file is now written through a shared crash-safe writer (`remote_energy_meter.atomic_file`), which
   also provides the descriptor-relative writer of the security-store foundation. Its sequence is the one the energy
   store already used: an exclusive owner-only temporary file in the same directory, flushed and synced, atomically
