@@ -109,6 +109,18 @@ All notable changes to this project are documented here. The format follows
   transaction acted on, and every transaction and lookup acts on the later of that and the clock, so a wall clock
   that steps back cannot make a compacted, already-consumed credential look unexpired again. The cost is that a write
   made while the clock is wrong-forward holds pairing and recovery until real time catches up.
+- Added pure, bounded retention tables (`remote_energy_meter.retention_tables`); nothing uses them yet. They are values
+  that do no file access and read no clock, for a domain store to embed in its own authenticated document so that a
+  nonce, a state change and a retry result commit in one write. `NonceTable` remembers accepted signed-request nonces
+  through the request's expiry instant; `ExactRetryTable` returns a completed mutation's exact status and body only to
+  an unexpired request that matches every bound field (purpose, request hash, nonce, key generations);
+  `OperationResultTable` keeps a roster action's result in full for 24 hours, then as a digest-only marker for 30
+  days, then ignores it. A signed request is valid through its own expiry instant, so nonces and retries use inclusive
+  windows, while operation results use half-open ones. Lookups decide from recorded instants only, so a lagging cleanup
+  never returns a result after its boundary. Each table is capacity-bounded and refuses rather than evicting; a nonce or
+  retry expiry may lie at most 90 seconds ahead (the longest a valid signed request lives), so a hostile far-future
+  expiry cannot pin a slot, and the bytes of operation bodies held in full are capped so the three tables together fit
+  one authenticated document.
 
 ### Changed
 
