@@ -108,7 +108,7 @@ documentation pass.
     `created`/expiry, signed nonce, and signature parameters. Reject every one-field mutation, route/purpose reuse,
     replay outside the endpoint's exact-retry rule, and any rewritten, normalized, aliased, or mismatched target.
     - _Scope: 3.2 delivers the stateless primitive checks only. Stateful replay and exact-retry rejection are delivered
-      by tasks 4.1 (durable replay and exact-result records), 7.2.1 (signed-control nonce consumption and exact-retry
+      by tasks 4.1 (the consumed-credential and exact-result records and the pure replay and retry tables), 7.2.1 (signed-control nonce consumption and exact-retry
       cache), and 10.2 (report replay and identical-retry handling)._
     - _Requirements: 3.1, 6.1, 7.5f_
   - [x] 3.3 Replace task 3.1's SAS index placeholders by implementing requirement 4.3's normative rendering: pin and
@@ -124,7 +124,7 @@ documentation pass.
 
 - [ ] 4. Add configuration, durable PKI, roster, and one-use token state
   - _Requirements: 1.5, 2.2, 3.1, 4.5, 5.1, 5.2, 5.3, 5.4, 6.5, 7.3, 7.6, 8.1_
-  - [ ] 4.1 First extract and promote the existing `state_store.py` `_write_atomically` and `_fsync_directory`
+  - [x] 4.1 First extract and promote the existing `state_store.py` `_write_atomically` and `_fsync_directory`
     mechanism into a shared persistence helper, keep `EnergyStateStore` using that helper, and preserve its regression
     tests. Then test and implement the atomic owner-only PKI, roster, token, revocation, control-authority, control-SPKI,
     and energy stores with that shared helper rather than a parallel writer. Preserve same-filesystem `O_EXCL`
@@ -139,9 +139,23 @@ documentation pass.
     reporter-authority quarantine transitions. Add encrypted backup/restore consistency coverage across multiple secret
     generations, prove restore never extends an embedded expiry, and prove missing or partial post-restore quarantine
     state blocks normal service.
+    - _Scope: 4.1 delivers the shared secure writer and fail-closed versioned and authenticated stores, the
+      state-authentication key, the control TLS identity, the generated reporter CA and leaf, the control authority
+      (pairing, recovery, consumed credentials, exact confirm and revoke results, clock guard), pure retention tables
+      for nonces, exact retries and 24-hour/30-day operation results, and the post-restore quarantine with the
+      one-sided restore comparator, with whole-tree restore scenarios. Reassigned to the tasks that own the behaviour:
+      the reporter roster and lifecycle (4.2); managed-token operation and revocation records (4.3); reporter-key and
+      control-key rotation challenge records, which embed the retention tables in their domain stores (7.2.5, 7.2.6);
+      MQTT key and wrapping-key state (7.2.1, 9.1); the restore declaration and the integration-side marker (7.4); and
+      the roster's side of quarantine, restored-identity deletion (4.2)._
     - _Requirements: 2.2, 5.1, 5.3, 5.4, 5.5, 7.5a, 7.5d, 7.5e, 7.5f_
   - [ ] 4.2 Test and implement reporter lifecycle, stable IDs, public-key rotation, revocation tombstones, and
-    capacities.
+    capacities. Consume the post-restore quarantine (`restore_guard.QuarantineStore`): a declared restore passes every
+    restored reporter ID to `declare_restore`, reporter traffic stays closed until the quarantine is released, and a
+    restored identity's deletion is made durable in the roster first; only then is `dispose_reporter` called, and only
+    while the add-on is quarantined. A crash between the two is repaired on start by calling `dispose_reporter`
+    (idempotent) for every pending reporter that is no longer in the roster. Never dispose before the deletion is
+    durable.
     - _Requirements: 2.2, 3.1, 8.1_
   - [ ] 4.3 Test and implement only the managed-enrollment durable-store primitives: owner-only atomic records for
     unique hashed token verifiers and bounded public operation/revocation state, expiry-plus-grace lookup and
@@ -367,7 +381,12 @@ documentation pass.
     second fresh credential for subsequent bootstrap. Cover cross-instance, cross-purpose, field/scope substitution, replay before and after
     restart, expiry boundaries, loss/compromise, stale/unsigned transitions, one-sided restore mismatch, and coordinated
     full-system restore with durable quarantine before normal service; prove restored control authority cannot
-    administer and fresh pairing never reactivates it. Also cover crashes at every durable boundary, exact revoke
+    administer and fresh pairing never reactivates it.
+    Wire the restore declaration, which the add-on cannot detect by itself and a restore of `/data` would overwrite:
+    the administrator's declaration reaches the add-on after the data is restored and before normal service, calls
+    `QuarantineStore.declare_restore`, and creates the integration's own durable marker; both endpoints call
+    `compare_control_state` on every control connect and disable control on anything but a match; the add-on creates
+    its clear quarantine record on first start and treats an absent or damaged record as blocked. Also cover crashes at every durable boundary, exact revoke
     retry, interrupted replacement, and failed key deletion.
     - _Requirements: 5.1, 5.2, 5.3, 5.4, 5.5, 7.5a, 7.5d, 7.5e_
   - Demo: fake reporter produces a native Discovered card and approval activates it without creating another config
