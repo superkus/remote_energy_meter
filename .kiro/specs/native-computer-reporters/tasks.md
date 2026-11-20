@@ -156,6 +156,8 @@ documentation pass.
     while the add-on is quarantined. A crash between the two is repaired on start by calling `dispose_reporter`
     (idempotent) for every pending reporter that is no longer in the roster. Never dispose before the deletion is
     durable.
+    - _Progress: the roster store (`roster.py`) and reporter metadata (`reporter_metadata.py`) are done; the
+      quarantine/dispose orchestration above is not yet wired and keeps this task open._
     - _Requirements: 2.2, 3.1, 8.1_
   - [ ] 4.3 Test and implement only the managed-enrollment durable-store primitives: owner-only atomic records for
     unique hashed token verifiers and bounded public operation/revocation state, expiry-plus-grace lookup and
